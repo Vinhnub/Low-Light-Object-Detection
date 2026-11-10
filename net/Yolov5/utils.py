@@ -5,13 +5,131 @@ and Non-Maximum Suppression (NMS).
 """
 
 import math
+import os
+import sys
 import time
-from typing import List, Optional, Tuple, Union
+import types
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
+
+
+PRETRAINED_URLS: Dict[str, str] = {
+    "yolov5n": "https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5n.pt",
+    "yolov5s": "https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5s.pt",
+    "yolov5m": "https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5m.pt",
+    "yolov5l": "https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5l.pt",
+    "yolov5x": "https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5x.pt",
+}
+
+
+def load_yolov5_checkpoint(
+    model: nn.Module,
+    ckpt_path: str,
+    model_name: str = "yolov5s",
+    verbose: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """
+    Load either an official Ultralytics YOLOv5 COCO pretrained `.pt` file
+    (e.g., `yolov5s.pt`, `yolov5n.pt`) or a custom training `.pth` checkpoint
+    into `model` (supporting both `DetectionModel` and modular `YOLOv5`).
+    Automatically downloads official `.pt` weights into `./weights/pretrained/` if `"auto"` is passed.
+    """
+    if not ckpt_path or str(ckpt_path).lower() in {"none", "false", "no"}:
+        return None
+
+    m_key = model_name.lower().replace(".pt", "").replace(".pth", "")
+    if str(ckpt_path).lower() == "auto":
+        os.makedirs("./weights/pretrained", exist_ok=True)
+        ckpt_path = f"./weights/pretrained/{m_key}.pt"
+
+    if not os.path.exists(ckpt_path) and m_key in PRETRAINED_URLS:
+        os.makedirs(os.path.dirname(os.path.abspath(ckpt_path)), exist_ok=True)
+        url = PRETRAINED_URLS[m_key]
+        if verbose:
+            print(f"===> Downloading official COCO pretrained weights {m_key}.pt from {url} ...")
+        urllib.request.urlretrieve(url, ckpt_path)
+
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found at: {ckpt_path}")
+
+    # Register module aliases so official Ultralytics pickled .pt files unpickle cleanly
+    import net.Yolov5 as y5_pkg
+
+    sys.modules.setdefault("models", y5_pkg)
+    sys.modules.setdefault("models.common", y5_pkg.common)
+    sys.modules.setdefault("models.yolo", y5_pkg.yolo)
+    sys.modules.setdefault("utils", types.ModuleType("utils"))
+    sys.modules.setdefault("utils.loss", types.ModuleType("utils.loss"))
+
+    checkpoint_data = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    raw_state_dict = checkpoint_data
+    if isinstance(checkpoint_data, dict):
+        if "state_dict" in checkpoint_data:
+            raw_state_dict = checkpoint_data["state_dict"]
+        elif "ema" in checkpoint_data and checkpoint_data["ema"] is not None:
+            ema_obj = checkpoint_data["ema"]
+            raw_state_dict = (
+                ema_obj.float().state_dict()
+                if hasattr(ema_obj, "state_dict")
+                else ema_obj
+            )
+        elif "model" in checkpoint_data and checkpoint_data["model"] is not None:
+            m_obj = checkpoint_data["model"]
+            raw_state_dict = (
+                m_obj.float().state_dict()
+                if hasattr(m_obj, "state_dict")
+                else m_obj
+            )
+
+    # Map sequential `model.0..24.*` keys to modular `backbone.*` / `neck.*` / `head.*` if needed
+    seq_to_mod_prefix = {
+        "model.0.": "backbone.stem.",
+        "model.1.": "backbone.stage1.0.",
+        "model.2.": "backbone.stage1.1.",
+        "model.3.": "backbone.stage2.0.",
+        "model.4.": "backbone.stage2.1.",
+        "model.5.": "backbone.stage3.0.",
+        "model.6.": "backbone.stage3.1.",
+        "model.7.": "backbone.stage4.0.",
+        "model.8.": "backbone.stage4.1.",
+        "model.9.": "backbone.stage4.2.",
+        "model.10.": "neck.reduce_p5.",
+        "model.13.": "neck.c3_p4.",
+        "model.14.": "neck.reduce_p4.",
+        "model.17.": "neck.c3_p3.",
+        "model.18.": "neck.down_p3.",
+        "model.20.": "neck.c3_n4.",
+        "model.21.": "neck.down_p4.",
+        "model.23.": "neck.c3_n5.",
+        "model.24.": "head.",
+    }
+
+    model_dict = model.state_dict()
+    filtered_state_dict = {}
+    for k, v in raw_state_dict.items():
+        name = k[7:] if k.startswith("module.") else k
+        if isinstance(v, torch.Tensor) and v.is_floating_point():
+            v = v.float()
+        if name not in model_dict:
+            for seq_p, mod_p in seq_to_mod_prefix.items():
+                if name.startswith(seq_p):
+                    name = mod_p + name[len(seq_p) :]
+                    break
+        if name in model_dict and model_dict[name].shape == v.shape:
+            filtered_state_dict[name] = v
+
+    model.load_state_dict(filtered_state_dict, strict=False)
+    if verbose:
+        print(
+            f"===> Loaded {len(filtered_state_dict)}/{len(model_dict)} weight tensors from '{ckpt_path}'"
+        )
+    return checkpoint_data if isinstance(checkpoint_data, dict) else None
 
 
 def make_divisible(x: float, divisor: int = 8) -> int:

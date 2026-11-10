@@ -39,8 +39,8 @@ def option():
     parser.add_argument(
         "--pretrained",
         type=str,
-        default="",
-        help="Path to pretrained weights (.pt / .pth) to load before training",
+        default="auto",
+        help="Path to COCO pretrained weights (.pt / .pth), 'auto' to load/download official yolov5*.pt, or 'none' to train from scratch",
     )
     parser.add_argument(
         "--resume",
@@ -86,7 +86,7 @@ def option():
     parser.add_argument(
         "--lr",
         type=float,
-        default=1e-2,
+        default=5e-4,
         help="Initial learning rate (1e-2 for SGD, 1e-3 for Adam/AdamW)",
     )
     parser.add_argument(
@@ -98,7 +98,7 @@ def option():
     parser.add_argument(
         "--optimizer",
         type=str,
-        default="SGD",
+        default="Adam",
         choices=["SGD", "Adam", "AdamW"],
         help="Optimizer type",
     )

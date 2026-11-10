@@ -30,11 +30,13 @@ from .common import (
     autopad,
 )
 from .utils import (
+    PRETRAINED_URLS,
     box_iou,
     check_anchor_order,
     clip_boxes,
     fuse_conv_and_bn,
     initialize_weights,
+    load_yolov5_checkpoint,
     make_divisible,
     non_max_suppression,
     scale_boxes,

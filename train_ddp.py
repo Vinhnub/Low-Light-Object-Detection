@@ -22,17 +22,14 @@ from data.data import *
 from data.options import option
 from data.scheduler import *
 from data.util import DARKFACE_CLASSES, EXDARK_CLASSES, xywhn2xyxy
+from eval import eval
 from loss.losses import *
-from measure import (
-    VOC_CLASSES,
-    ObjectDetectionEvaluator,
-    print_academic_report,
-)
+from measure import VOC_CLASSES
 from net.Yolov5 import (
     DetectionModel,
     YOLOv5,
+    load_yolov5_checkpoint,
     non_max_suppression,
-    scale_boxes,
     yolov5l,
     yolov5m,
     yolov5n,
@@ -304,85 +301,6 @@ def train(epoch: int, local_rank: int):
     return loss_print, pic_cnt, detailed_losses
 
 
-def evaluate_detection(model_eval, data_loader, class_names, pred_save_dir=None):
-    """
-    Chạy đánh giá trên tiến trình master (rank 0) dùng module gốc `get_model_module(model)`.
-    Tính toán mAP@0.50, mAP@0.75, mAP@0.50:0.95 qua `ObjectDetectionEvaluator` từ `measure.py`.
-    """
-    model_eval.eval()
-    evaluator = ObjectDetectionEvaluator(class_names=class_names, method="coco")
-
-    if pred_save_dir:
-        os.makedirs(pred_save_dir, exist_ok=True)
-
-    with torch.no_grad():
-        for batch in tqdm(data_loader, desc="Evaluating Validation Set (Rank 0)"):
-            imgs, targets, paths, shapes = batch[0], batch[1], batch[2], batch[3]
-            if opt.gpu_mode:
-                imgs = imgs.cuda(non_blocking=True)
-
-            pred_out, _ = model_eval(imgs)
-            dets_batch = non_max_suppression(
-                pred_out,
-                conf_thres=opt.conf_thres,
-                iou_thres=opt.iou_thres,
-                max_det=opt.max_det,
-            )
-
-            for si, det in enumerate(dets_batch):
-                img_path = paths[si]
-                stem = Path(img_path).stem
-                h0, w0 = shapes[si][0]
-                ratio_pad = shapes[si][1]
-
-                t_si = targets[targets[:, 0] == si]
-                if len(t_si):
-                    t_np = t_si[:, 1:].cpu().numpy()
-                    t_xyxy = xywhn2xyxy(
-                        t_np[:, 1:5],
-                        w=imgs.shape[3],
-                        h=imgs.shape[2],
-                    )
-                    t_xyxy_t = scale_boxes(
-                        imgs.shape[2:],
-                        torch.from_numpy(t_xyxy),
-                        (h0, w0),
-                        ratio_pad=ratio_pad,
-                    ).numpy()
-                    for cid, box in zip(t_np[:, 0].astype(int), t_xyxy_t):
-                        evaluator.add_ground_truth(stem, int(cid), box.tolist())
-                else:
-                    evaluator.image_ids.add(stem)
-
-                pred_lines = []
-                if len(det):
-                    det_clone = det.clone()
-                    det_clone[:, :4] = scale_boxes(
-                        imgs.shape[2:],
-                        det_clone[:, :4],
-                        (h0, w0),
-                        ratio_pad=ratio_pad,
-                    )
-                    for *xyxy, conf, cls_id in det_clone.cpu().numpy():
-                        cid = int(cls_id)
-                        score = float(conf)
-                        box = [float(v) for v in xyxy]
-                        evaluator.add_prediction(stem, cid, score, box)
-                        cname = class_names[cid] if 0 <= cid < len(class_names) else str(cid)
-                        pred_lines.append(
-                            f"{cname} {score:.6f} {box[0]:.2f} {box[1]:.2f} {box[2]:.2f} {box[3]:.2f}\n"
-                        )
-
-                if pred_save_dir:
-                    pred_txt_path = os.path.join(pred_save_dir, f"{stem}.txt")
-                    with open(pred_txt_path, "w", encoding="utf-8") as pf:
-                        pf.writelines(pred_lines)
-
-    results = evaluator.evaluate(conf_threshold=opt.conf_thres)
-    print_academic_report(results, class_names)
-    return results
-
-
 def checkpoint(epoch: int, lr=None, tag=None):
     filename = f"epoch_{epoch}.pth" if tag is None else f"epoch_{epoch}_{tag}.pth"
     model_out_path = os.path.join(opt.save_folder, filename)
@@ -414,26 +332,34 @@ def load_datasets():
         train_set = get_exdark_training_set(
             opt.data_train_exdark, size=opt.imgSize, hyp=opt
         )
-        test_set = get_exdark_val_set(opt.data_val_exdark, size=opt.imgSize)
+        val_set = get_exdark_val_set(opt.data_val_exdark, size=opt.imgSize)
+        test_set = (
+            get_exdark_test_set(opt.data_test_exdark, size=opt.imgSize)
+            if os.path.exists(opt.data_test_exdark)
+            else val_set
+        )
     elif opt.dataset == "darkface":
         train_set = get_darkface_training_set(
             opt.data_train_darkface, size=opt.imgSize, hyp=opt
         )
-        test_set = get_darkface_val_set(opt.data_val_darkface, size=opt.imgSize)
+        val_set = get_darkface_val_set(opt.data_val_darkface, size=opt.imgSize)
+        test_set = val_set
     elif opt.dataset == "voc":
         train_set = get_training_set(
             opt.data_train_voc, size=opt.imgSize, dataset_name="voc", hyp=opt
         )
-        test_set = get_eval_set(
+        val_set = get_eval_set(
             opt.data_val_voc, size=opt.imgSize, dataset_name="voc"
         )
+        test_set = val_set
     elif opt.dataset == "custom":
         train_set = get_training_set(
             opt.data_train_custom, size=opt.imgSize, dataset_name="custom", hyp=opt
         )
-        test_set = get_eval_set(
+        val_set = get_eval_set(
             opt.data_val_custom, size=opt.imgSize, dataset_name="custom"
         )
+        test_set = val_set
     else:
         raise Exception("should choose a supported dataset (exdark, darkface, voc, custom)")
 
@@ -468,20 +394,27 @@ def load_datasets():
         )
 
     testing_data_loader = DataLoader(
-        dataset=test_set,
-        num_workers=opt.threads,
+        dataset=val_set,
+        num_workers=0,
         batch_size=opt.batchSize,
         shuffle=False,
         pin_memory=pin_memory,
-        persistent_workers=use_persistent,
-        prefetch_factor=prefetch,
+        collate_fn=collate_fn,
+    )
+    final_test_data_loader = DataLoader(
+        dataset=test_set,
+        num_workers=0,
+        batch_size=opt.batchSize,
+        shuffle=False,
+        pin_memory=pin_memory,
         collate_fn=collate_fn,
     )
     if is_master():
         print(
-            f"===> Train samples: {len(train_set)} | Val samples: {len(test_set)} | World size: {get_world_size()}"
+            f"===> Train samples: {len(train_set)} | Val samples: {len(val_set)} | "
+            f"Test samples: {len(test_set)} | World size: {get_world_size()}"
         )
-    return training_data_loader, testing_data_loader
+    return training_data_loader, testing_data_loader, final_test_data_loader
 
 
 def build_model(local_rank: int, num_classes: int):
@@ -507,8 +440,10 @@ def build_model(local_rank: int, num_classes: int):
 
     checkpoint_data = None
     ckpt_path = ""
+    is_resume = False
     if opt.resume and os.path.exists(opt.resume):
         ckpt_path = opt.resume
+        is_resume = True
     elif opt.start_epoch > 0:
         ckpt_path = os.path.join(opt.save_folder, f"epoch_{opt.start_epoch}.pth")
         if not os.path.exists(ckpt_path):
@@ -517,32 +452,21 @@ def build_model(local_rank: int, num_classes: int):
                 ckpt_path = alt_path
             elif is_master():
                 raise FileNotFoundError(f"Checkpoint not found at: {ckpt_path}")
-    elif opt.pretrained and os.path.exists(opt.pretrained):
+        is_resume = True
+    elif opt.pretrained and str(opt.pretrained).lower() not in {"none", "false", "no"}:
         ckpt_path = opt.pretrained
 
-    if ckpt_path and os.path.exists(ckpt_path):
-        checkpoint_data = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        raw_state_dict = checkpoint_data
-        if isinstance(checkpoint_data, dict) and "state_dict" in checkpoint_data:
-            raw_state_dict = checkpoint_data["state_dict"]
-        elif isinstance(checkpoint_data, dict) and "model" in checkpoint_data:
-            raw_state_dict = (
-                checkpoint_data["model"].state_dict()
-                if hasattr(checkpoint_data["model"], "state_dict")
-                else checkpoint_data["model"]
-            )
-
-        model_dict = net.state_dict()
-        filtered_state_dict = {}
-        for k, v in raw_state_dict.items():
-            name = k[7:] if k.startswith("module.") else k
-            if name in model_dict and model_dict[name].shape == v.shape:
-                filtered_state_dict[name] = v
-        net.load_state_dict(filtered_state_dict, strict=False)
-        if is_master():
-            print(
-                f"Loaded {len(filtered_state_dict)}/{len(model_dict)} weight tensors from {ckpt_path}"
-            )
+    if ckpt_path:
+        # Ensure rank 0 downloads first if auto-downloading
+        if dist.is_initialized() and not is_master():
+            dist.barrier()
+        loaded_ckpt = load_yolov5_checkpoint(
+            net, ckpt_path, model_name=opt.model, verbose=is_master()
+        )
+        if dist.is_initialized() and is_master():
+            dist.barrier()
+        if is_resume:
+            checkpoint_data = loaded_ckpt
 
     # Đồng bộ BatchNorm và bọc model bằng DistributedDataParallel khi chạy đa GPU
     if dist.is_initialized():
@@ -642,7 +566,7 @@ if __name__ == "__main__":
     class_names = get_class_names()
     opt.num_classes = len(class_names)
 
-    training_data_loader, testing_data_loader = load_datasets()
+    training_data_loader, testing_data_loader, final_test_data_loader = load_datasets()
     model, checkpoint_data = build_model(local_rank, num_classes=len(class_names))
 
     # Xác định learning rate khi bắt đầu / tiếp tục train
@@ -695,6 +619,8 @@ if __name__ == "__main__":
     map50_95_history = []
     best_map50 = 0.0
     best_map50_95 = 0.0
+    best_model_path = None
+    last_model_path = None
 
     start_epoch = opt.start_epoch if opt.start_epoch > 0 else 0
     now = datetime.now().strftime("%Y-%m-%d-%H%M%S")
@@ -723,6 +649,8 @@ if __name__ == "__main__":
             )
             f.write("|---|---|---|---|---|---|---|---|---|---|---|---|\n")
 
+    eval_device = f"cuda:{local_rank}" if opt.gpu_mode else "cpu"
+
     for epoch in range(start_epoch + 1, opt.nEpochs + start_epoch + 1):
         current_lr = optimizer.param_groups[0]["lr"]
         epoch_loss, pic_num, detailed_losses = train(epoch, local_rank)
@@ -730,17 +658,24 @@ if __name__ == "__main__":
 
         if epoch % opt.snapshots == 0 or epoch == (opt.nEpochs + start_epoch):
             model_out_path = checkpoint(epoch, lr=current_lr)
+            last_model_path = model_out_path
 
             # Chỉ rank 0 thực hiện đánh giá (eval) và ghi kết quả
             if is_master():
                 output_folder = f"{opt.dataset}_preds/"
                 pred_save_dir = os.path.join(opt.val_folder, output_folder)
 
-                results = evaluate_detection(
-                    get_model_module(model),
-                    testing_data_loader,
+                results = eval(
+                    model=get_model_module(model),
+                    testing_data_loader=testing_data_loader,
+                    model_path=model_out_path,
+                    output_folder=pred_save_dir,
                     class_names=class_names,
-                    pred_save_dir=pred_save_dir,
+                    device=eval_device,
+                    conf_thres=opt.conf_thres,
+                    iou_thres=opt.iou_thres,
+                    max_det=opt.max_det,
+                    desc="Evaluating Validation Set (Rank 0)",
                 )
 
                 cur_map50 = results["mAP50"]
@@ -766,7 +701,7 @@ if __name__ == "__main__":
                 note_list = []
                 if cur_map50 > best_map50:
                     best_map50 = cur_map50
-                    checkpoint(epoch, lr=current_lr, tag="best_mAP50")
+                    best_model_path = checkpoint(epoch, lr=current_lr, tag="best_mAP50")
                     note_list.append("Best mAP@0.50")
                 if cur_map50_95 > best_map50_95:
                     best_map50_95 = cur_map50_95
@@ -789,5 +724,47 @@ if __name__ == "__main__":
             if opt.gpu_mode:
                 torch.cuda.empty_cache()
 
+    # Tự động đánh giá tập TEST bằng checkpoint tốt nhất trên rank 0 sau khi kết thúc huấn luyện
+    if is_master():
+        final_ckpt = (
+            best_model_path
+            if (best_model_path and os.path.exists(best_model_path))
+            else last_model_path
+        )
+        if final_ckpt and os.path.exists(final_ckpt):
+            print("\n" + "=" * 95)
+            print(f"===> [Final Test] Tự động đánh giá tập TEST với weight tốt nhất: {final_ckpt}")
+            print("=" * 95)
+            test_pred_dir = os.path.join(opt.val_folder, f"{opt.dataset}_test_preds")
+            test_results = eval(
+                model=get_model_module(model),
+                testing_data_loader=final_test_data_loader,
+                model_path=final_ckpt,
+                output_folder=test_pred_dir,
+                class_names=class_names,
+                device=eval_device,
+                conf_thres=opt.conf_thres,
+                iou_thres=opt.iou_thres,
+                max_det=opt.max_det,
+                desc="Testing on Test Set (Best Weight, Rank 0)",
+            )
+            t_map50 = test_results["mAP50"]
+            t_map75 = test_results["mAP75"]
+            t_map50_95 = test_results["mAP50_95"]
+            t_p = test_results["mean_precision"]
+            t_r = test_results["mean_recall"]
+            print("===> [TEST SET] Avg.Precision@0.50: {:.4f}".format(t_p))
+            print("===> [TEST SET] Avg.Recall@0.50:    {:.4f}".format(t_r))
+            print("===> [TEST SET] mAP@0.50:           {:.4f} ({:.2f}%)".format(t_map50, t_map50 * 100))
+            print("===> [TEST SET] mAP@0.75:           {:.4f} ({:.2f}%)".format(t_map75, t_map75 * 100))
+            print("===> [TEST SET] mAP@0.50:0.95:      {:.4f} ({:.2f}%)".format(t_map50_95, t_map50_95 * 100))
+            with open(metrics_md_path, "a", encoding="utf-8") as f:
+                f.write(
+                    f"| **Test (Best)** | - | - | - | - | "
+                    f"**{t_p:.4f}** | **{t_r:.4f}** | **{t_map50:.4f}** | **{t_map75:.4f}** | "
+                    f"**{t_map50_95:.4f}** | - | `{os.path.basename(final_ckpt)}` |\n"
+                )
+
     if dist.is_initialized():
+        dist.barrier()
         dist.destroy_process_group()
