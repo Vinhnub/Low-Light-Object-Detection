@@ -123,6 +123,12 @@ def option():
         help="number of worker threads for dataloader to use",
     )
     parser.add_argument(
+        "--cache_images",
+        type=_str2bool,
+        default=True,
+        help="Cache resized images in RAM for faster Mosaic/DataLoader throughput",
+    )
+    parser.add_argument(
         "--amp",
         type=_str2bool,
         default=True,

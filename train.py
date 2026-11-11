@@ -594,8 +594,8 @@ if __name__ == "__main__":
             pred_save_dir = os.path.join(opt.val_folder, output_folder)
             eval_net = ema.ema if (ema is not None) else model
 
-            # 1. Chạy suy luận & xuất file dự đoán qua eval.py (sử dụng trọng số EMA nếu bật)
-            eval(
+            # 1. Chạy suy luận & lưu dự đoán trong RAM qua eval.py (sử dụng trọng số EMA nếu bật)
+            val_preds = eval(
                 model=eval_net,
                 testing_data_loader=testing_data_loader,
                 model_path=None,
@@ -605,6 +605,9 @@ if __name__ == "__main__":
                 conf_thres=opt.conf_thres,
                 iou_thres=opt.iou_thres,
                 max_det=opt.max_det,
+                half=(opt.amp and opt.gpu_mode),
+                save_txt=False,
+                return_preds=True,
                 desc="Evaluating Validation Set (EMA)" if (ema is not None) else "Evaluating Validation Set",
             )
 
@@ -615,6 +618,7 @@ if __name__ == "__main__":
                 class_names=class_names,
                 dataset_type=opt.dataset,
                 conf_thres=opt.conf_thres,
+                in_memory_preds=val_preds,
             )
 
             cur_map50 = results["mAP50"]
@@ -672,7 +676,7 @@ if __name__ == "__main__":
         test_pred_dir = os.path.join(opt.val_folder, f"{opt.dataset}_test_preds")
 
         # 1. Xuất dự đoán trên tập Test qua eval.py
-        eval(
+        test_preds = eval(
             model=model,
             testing_data_loader=final_test_data_loader,
             model_path=final_ckpt,
@@ -682,6 +686,9 @@ if __name__ == "__main__":
             conf_thres=opt.conf_thres,
             iou_thres=opt.iou_thres,
             max_det=opt.max_det,
+            half=(opt.amp and opt.gpu_mode),
+            save_txt=True,
+            return_preds=True,
             desc="Testing on Test Set (Best Weight)",
         )
 
@@ -692,6 +699,7 @@ if __name__ == "__main__":
             class_names=class_names,
             dataset_type=opt.dataset,
             conf_thres=opt.conf_thres,
+            in_memory_preds=test_preds,
         )
         t_map50 = test_results["mAP50"]
         t_map75 = test_results["mAP75"]

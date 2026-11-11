@@ -12,6 +12,7 @@ Implements the complete YOLOv5 training & evaluation data pipeline:
 import glob
 import os
 import random
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -54,6 +55,7 @@ DEFAULT_AUG_HYP: Dict[str, Any] = {
     "gamma": False,
     "start_gamma": 60,
     "end_gamma": 120,
+    "cache_images": False,
 }
 
 
@@ -93,6 +95,7 @@ class YOLODataset(Dataset):
         pad: float = 0.0,
         class_names: Optional[List[str]] = None,
         label_dir: Optional[str] = None,
+        cache_images: Optional[bool] = None,
     ):
         super().__init__()
         self.img_size = img_size
@@ -104,6 +107,11 @@ class YOLODataset(Dataset):
         self.pad = pad
         self.class_names = class_names or EXDARK_CLASSES
         self.class_to_id = {name: i for i, name in enumerate(self.class_names)}
+        self.cache_images = (
+            bool(self.hyp.get("cache_images", False))
+            if cache_images is None
+            else bool(cache_images)
+        )
 
         # Collect image files
         self.im_files = self._resolve_image_files(path)
@@ -121,8 +129,17 @@ class YOLODataset(Dataset):
         self.n = len(self.im_files)
         self.indices = range(self.n)
 
-        # Load or build fast disk cache of labels (YOLOv5 .cache style) to avoid slow NTFS file I/O
+        # RAM cache containers for resized images and dimensions
+        self.ims: List[Optional[np.ndarray]] = [None] * self.n
+        self.im_hw0: List[Optional[Tuple[int, int]]] = [None] * self.n
+        self.im_hw: List[Optional[Tuple[int, int]]] = [None] * self.n
+
+        # Load or build fast disk cache of labels (YOLOv5 .cache style) to avoid slow file I/O
         self.labels: List[Optional[np.ndarray]] = self._load_or_create_label_cache(path)
+
+        # Optionally cache resized images in RAM (enabled on Linux/Kaggle or when requested)
+        if self.cache_images and os.name != "nt":
+            self._cache_images_to_ram(path)
 
     def _load_or_create_label_cache(
         self, path: Union[str, Path, List[str]]
@@ -252,11 +269,10 @@ class YOLODataset(Dataset):
     def __len__(self) -> int:
         return len(self.im_files)
 
-    def load_image(self, i: int) -> Tuple[np.ndarray, Tuple[int, int], Tuple[int, int]]:
-        """
-        Load 1 image from dataset index `i`.
-        Returns `(im, (h0, w0), (h, w))` where `im` is BGR uint8.
-        """
+    def _load_image_from_disk(
+        self, i: int
+    ) -> Tuple[np.ndarray, Tuple[int, int], Tuple[int, int]]:
+        """Read and resize 1 image from disk at index `i`."""
         f = self.im_files[i]
         im = cv2.imread(f)  # BGR
         if im is None:
@@ -272,7 +288,66 @@ class YOLODataset(Dataset):
             im = cv2.resize(
                 im, (int(w0 * r), int(h0 * r)), interpolation=interp
             )
-        return im, (h0, w0), im.shape[:2]  # im, hw_original, hw_resized
+        return im, (h0, w0), im.shape[:2]
+
+    def _cache_images_to_ram(
+        self,
+        path: Union[str, Path, List[str]],
+        max_gb: float = 6.0,
+    ) -> None:
+        """
+        Pre-load resized images into RAM using a thread pool to eliminate disk I/O
+        and repeated `cv2.imread` + `cv2.resize` overhead during Mosaic and Validation.
+        Caps memory usage at `max_gb` per process so multi-GPU runs stay within system RAM.
+        """
+        max_bytes = int(max_gb * (1 << 30))
+        used_bytes = 0
+        any_label_resolved = False
+
+        def _worker(idx: int):
+            im, hw0, hw = self._load_image_from_disk(idx)
+            lbl = self.labels[idx]
+            if lbl is None:
+                lbl = parse_label_file(
+                    self.label_files[idx],
+                    img_w=hw0[1],
+                    img_h=hw0[0],
+                    class_to_id=self.class_to_id,
+                )
+            return idx, im, hw0, hw, lbl
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for idx, im, hw0, hw, lbl in pool.map(_worker, range(self.n)):
+                if self.labels[idx] is None and lbl is not None:
+                    self.labels[idx] = lbl
+                    any_label_resolved = True
+                if used_bytes + im.nbytes <= max_bytes:
+                    self.ims[idx] = im
+                    self.im_hw0[idx] = hw0
+                    self.im_hw[idx] = hw
+                    used_bytes += im.nbytes
+
+        if any_label_resolved and isinstance(path, (str, Path)):
+            p_obj = Path(path)
+            cache_path = (
+                p_obj.parent / f"{p_obj.name}_labels.cache.pt"
+                if p_obj.is_dir()
+                else p_obj.with_suffix(".labels.cache.pt")
+            )
+            try:
+                torch.save({"n": self.n, "labels": self.labels}, cache_path)
+            except Exception:
+                pass
+
+    def load_image(self, i: int) -> Tuple[np.ndarray, Tuple[int, int], Tuple[int, int]]:
+        """
+        Load 1 image from dataset index `i` (from RAM cache if available, otherwise disk).
+        Returns `(im, (h0, w0), (h, w))` where `im` is BGR uint8.
+        """
+        im = self.ims[i]
+        if im is None:
+            return self._load_image_from_disk(i)
+        return im, self.im_hw0[i], self.im_hw[i]
 
     def load_mosaic(self, index: int) -> Tuple[np.ndarray, np.ndarray]:
         """YOLOv5 4-mosaic loader. Loads 1 image + 3 random images into a 4-image mosaic."""
@@ -484,6 +559,7 @@ class ExDarkDataset(YOLODataset):
         img_size: int = 640,
         augment: Optional[bool] = None,
         hyp: Optional[Union[Dict[str, Any], Any]] = None,
+        cache_images: Optional[bool] = None,
     ):
         data_path = Path(data_dir)
         if augment is None:
@@ -503,6 +579,7 @@ class ExDarkDataset(YOLODataset):
             augment=augment,
             hyp=hyp,
             class_names=EXDARK_CLASSES,
+            cache_images=cache_images,
         )
 
 
@@ -524,6 +601,7 @@ class DarkFaceDataset(YOLODataset):
         hyp: Optional[Union[Dict[str, Any], Any]] = None,
         val_ratio: float = 0.15,
         seed: int = 42,
+        cache_images: Optional[bool] = None,
     ):
         data_path = Path(data_dir)
         if augment is None:
@@ -556,6 +634,7 @@ class DarkFaceDataset(YOLODataset):
             hyp=hyp,
             class_names=DARKFACE_CLASSES,
             label_dir=label_dir,
+            cache_images=cache_images,
         )
 
 

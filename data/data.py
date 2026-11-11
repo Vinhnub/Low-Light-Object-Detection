@@ -35,6 +35,7 @@ def get_exdark_training_set(
 def get_exdark_val_set(
     data_dir: str = "./dataset/ExDark/images/val",
     size: int = 640,
+    hyp: Optional[Union[Dict[str, Any], Any]] = None,
 ) -> ExDarkDataset:
     """Return ExDark validation dataset (letterbox only, no random augmentation)."""
     return ExDarkDataset(
@@ -42,12 +43,14 @@ def get_exdark_val_set(
         split="val",
         img_size=size,
         augment=False,
+        hyp=hyp,
     )
 
 
 def get_exdark_test_set(
     data_dir: str = "./dataset/ExDark/images/test",
     size: int = 640,
+    hyp: Optional[Union[Dict[str, Any], Any]] = None,
 ) -> ExDarkDataset:
     """Return ExDark official test dataset (letterbox only, no random augmentation)."""
     return ExDarkDataset(
@@ -55,6 +58,7 @@ def get_exdark_test_set(
         split="test",
         img_size=size,
         augment=False,
+        hyp=hyp,
     )
 
 
@@ -76,6 +80,7 @@ def get_darkface_training_set(
 def get_darkface_val_set(
     data_dir: str = "./dataset/DarkFace",
     size: int = 640,
+    hyp: Optional[Union[Dict[str, Any], Any]] = None,
 ) -> DarkFaceDataset:
     """Return DarkFace validation dataset (letterbox only)."""
     return DarkFaceDataset(
@@ -83,6 +88,7 @@ def get_darkface_val_set(
         split="val",
         img_size=size,
         augment=False,
+        hyp=hyp,
     )
 
 
@@ -111,18 +117,20 @@ def get_eval_set(
     data_dir: str,
     size: int = 640,
     dataset_name: str = "exdark",
+    hyp: Optional[Union[Dict[str, Any], Any]] = None,
 ) -> Dataset:
     """Generic evaluation/validation set builder based on dataset name."""
     name = dataset_name.lower()
     if name == "exdark":
-        return get_exdark_val_set(data_dir, size=size)
+        return get_exdark_val_set(data_dir, size=size, hyp=hyp)
     elif name == "darkface":
-        return get_darkface_val_set(data_dir, size=size)
+        return get_darkface_val_set(data_dir, size=size, hyp=hyp)
     else:
         return YOLODataset(
             path=data_dir,
             img_size=size,
             augment=False,
+            hyp=hyp,
         )
 
 

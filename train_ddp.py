@@ -1,5 +1,11 @@
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# Giới hạn số luồng CPU của OpenMP/MKL để tránh tranh chấp CPU giữa các worker trên Kaggle (4 vCPU)
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 import warnings
 warnings.filterwarnings("ignore", message=".*Grad strides do not match bucket view strides.*")
 
@@ -17,6 +23,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
+
+cv2.setNumThreads(0)
+cv2.ocl.setUseOpenCL(False)
+torch.set_num_threads(1)
 
 from data.data import *
 from data.options import option
@@ -79,6 +89,16 @@ def seed_torch():
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
+
+
+def _dataloader_worker_init_fn(worker_id: int):
+    """Khóa số luồng OpenCV / PyTorch bên trong mỗi DataLoader worker để tránh nghẽn CPU."""
+    cv2.setNumThreads(0)
+    cv2.ocl.setUseOpenCL(False)
+    torch.set_num_threads(1)
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def train_init() -> int:
@@ -228,7 +248,7 @@ def train(epoch: int, local_rank: int):
             gamma = random.randint(opt.start_gamma, opt.end_gamma) / 100.0
             imgs = imgs.clamp(1e-6, 1.0) ** gamma
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         if opt.amp and opt.gpu_mode:
             with torch.amp.autocast("cuda"):
@@ -254,9 +274,7 @@ def train(epoch: int, local_rank: int):
         if ema is not None:
             ema.update(model)
 
-        lbox_val = loss_items[0].item()
-        lobj_val = loss_items[1].item()
-        lcls_val = loss_items[2].item()
+        lbox_val, lobj_val, lcls_val = loss_items.detach().cpu().tolist()
         total_item_loss = lbox_val + lobj_val + lcls_val
 
         lbox_sum += lbox_val
@@ -347,13 +365,18 @@ def load_datasets():
     if is_master():
         print(f"===> Loading datasets: {opt.dataset}")
 
+    test_no_cache_hyp = {"cache_images": False}
     if opt.dataset == "exdark":
         train_set = get_exdark_training_set(
             opt.data_train_exdark, size=opt.imgSize, hyp=opt
         )
-        val_set = get_exdark_val_set(opt.data_val_exdark, size=opt.imgSize)
+        val_set = get_exdark_val_set(
+            opt.data_val_exdark, size=opt.imgSize, hyp=opt
+        )
         test_set = (
-            get_exdark_test_set(opt.data_test_exdark, size=opt.imgSize)
+            get_exdark_test_set(
+                opt.data_test_exdark, size=opt.imgSize, hyp=test_no_cache_hyp
+            )
             if os.path.exists(opt.data_test_exdark)
             else val_set
         )
@@ -361,14 +384,16 @@ def load_datasets():
         train_set = get_darkface_training_set(
             opt.data_train_darkface, size=opt.imgSize, hyp=opt
         )
-        val_set = get_darkface_val_set(opt.data_val_darkface, size=opt.imgSize)
+        val_set = get_darkface_val_set(
+            opt.data_val_darkface, size=opt.imgSize, hyp=opt
+        )
         test_set = val_set
     elif opt.dataset == "voc":
         train_set = get_training_set(
             opt.data_train_voc, size=opt.imgSize, dataset_name="voc", hyp=opt
         )
         val_set = get_eval_set(
-            opt.data_val_voc, size=opt.imgSize, dataset_name="voc"
+            opt.data_val_voc, size=opt.imgSize, dataset_name="voc", hyp=opt
         )
         test_set = val_set
     elif opt.dataset == "custom":
@@ -376,7 +401,7 @@ def load_datasets():
             opt.data_train_custom, size=opt.imgSize, dataset_name="custom", hyp=opt
         )
         val_set = get_eval_set(
-            opt.data_val_custom, size=opt.imgSize, dataset_name="custom"
+            opt.data_val_custom, size=opt.imgSize, dataset_name="custom", hyp=opt
         )
         test_set = val_set
     else:
@@ -384,9 +409,11 @@ def load_datasets():
 
     pin_memory = opt.gpu_mode and torch.cuda.is_available()
     use_persistent = opt.threads > 0
-    prefetch = 4 if opt.threads > 0 else None
+    prefetch = 2 if opt.threads > 0 else None
+    val_workers = 0 if os.name == "nt" else min(2, max(1, opt.threads))
+    eval_batch_size = max(1, opt.batchSize * 2)
 
-    # Khi dùng DDP, sử dụng DistributedSampler để chia đều dataset cho các GPU
+    # Khi dùng DDP, sử dụng DistributedSampler cho cả train và val để chia đều tải cho 2 GPU
     if dist.is_initialized():
         train_sampler = DistributedSampler(train_set, shuffle=opt.shuffle)
         training_data_loader = DataLoader(
@@ -398,6 +425,19 @@ def load_datasets():
             pin_memory=pin_memory,
             persistent_workers=use_persistent,
             prefetch_factor=prefetch,
+            worker_init_fn=_dataloader_worker_init_fn,
+            collate_fn=collate_fn,
+        )
+        val_sampler = DistributedSampler(val_set, shuffle=False, drop_last=False)
+        testing_data_loader = DataLoader(
+            dataset=val_set,
+            num_workers=val_workers,
+            batch_size=eval_batch_size,
+            sampler=val_sampler,
+            shuffle=False,
+            pin_memory=pin_memory,
+            persistent_workers=(val_workers > 0),
+            worker_init_fn=_dataloader_worker_init_fn,
             collate_fn=collate_fn,
         )
     else:
@@ -409,23 +449,27 @@ def load_datasets():
             pin_memory=pin_memory,
             persistent_workers=use_persistent,
             prefetch_factor=prefetch,
+            worker_init_fn=_dataloader_worker_init_fn,
+            collate_fn=collate_fn,
+        )
+        testing_data_loader = DataLoader(
+            dataset=val_set,
+            num_workers=val_workers,
+            batch_size=eval_batch_size,
+            shuffle=False,
+            pin_memory=pin_memory,
+            persistent_workers=(val_workers > 0),
+            worker_init_fn=_dataloader_worker_init_fn,
             collate_fn=collate_fn,
         )
 
-    testing_data_loader = DataLoader(
-        dataset=val_set,
-        num_workers=0,
-        batch_size=opt.batchSize,
-        shuffle=False,
-        pin_memory=pin_memory,
-        collate_fn=collate_fn,
-    )
     final_test_data_loader = DataLoader(
         dataset=test_set,
-        num_workers=0,
-        batch_size=opt.batchSize,
+        num_workers=val_workers,
+        batch_size=eval_batch_size,
         shuffle=False,
         pin_memory=pin_memory,
+        worker_init_fn=_dataloader_worker_init_fn,
         collate_fn=collate_fn,
     )
     if is_master():
@@ -627,7 +671,7 @@ if __name__ == "__main__":
 
     criterion = init_loss()
     scaler = torch.amp.GradScaler("cuda", enabled=(opt.amp and opt.gpu_mode))
-    ema = ModelEMA(model) if (opt.ema and is_master()) else None
+    ema = ModelEMA(model) if opt.ema else None
     if (
         ema is not None
         and checkpoint_data is not None
@@ -639,7 +683,8 @@ if __name__ == "__main__":
         if "model_state_dict" in checkpoint_data:
             get_model_module(model).load_state_dict(checkpoint_data["model_state_dict"], strict=False)
         ema.updates = int(checkpoint_data.get("ema_updates", 0))
-        print(f"===> Đã khôi phục trạng thái ModelEMA (updates={ema.updates})")
+        if is_master():
+            print(f"===> Đã khôi phục trạng thái ModelEMA (updates={ema.updates})")
 
     map50_history = []
     map75_history = []
@@ -706,33 +751,57 @@ if __name__ == "__main__":
             model_out_path = checkpoint(epoch, lr=current_lr)
             last_model_path = model_out_path
 
-            # Chỉ rank 0 thực hiện đánh giá (eval) và ghi kết quả
+            output_folder = f"{opt.dataset}_preds/"
+            pred_save_dir = os.path.join(opt.val_folder, output_folder)
+            eval_net = ema.ema if (ema is not None) else get_model_module(model)
+
+            # Đồng bộ buffers (running_mean, running_var) từ Rank 0 sang các GPU trước khi chạy Eval song song
+            if dist.is_initialized() and get_world_size() > 1:
+                for buf in eval_net.buffers():
+                    dist.broadcast(buf, src=0)
+
+            # 1. Chạy suy luận song song trên TẤT CẢ các GPU với FP16 (autocast) và lưu kết quả trong RAM
+            local_preds = eval(
+                model=eval_net,
+                testing_data_loader=testing_data_loader,
+                model_path=None,
+                output_folder=pred_save_dir,
+                class_names=class_names,
+                device=eval_device,
+                conf_thres=opt.conf_thres,
+                iou_thres=opt.iou_thres,
+                max_det=opt.max_det,
+                half=(opt.amp and opt.gpu_mode),
+                save_txt=False,
+                return_preds=True,
+                verbose=is_master(),
+                desc=(
+                    f"Evaluating Validation Set (EMA, DDP x{get_world_size()})"
+                    if (ema is not None)
+                    else f"Evaluating Validation Set (DDP x{get_world_size()})"
+                ),
+            )
+
+            if dist.is_initialized() and get_world_size() > 1:
+                gathered_preds = [None for _ in range(get_world_size())]
+                dist.all_gather_object(gathered_preds, local_preds)
+                merged_preds = {}
+                if is_master():
+                    for part in gathered_preds:
+                        if part:
+                            merged_preds.update(part)
+            else:
+                merged_preds = local_preds
+
+            # 2. Rank 0 tính toán và hiển thị các chỉ số đánh giá trực tiếp từ RAM qua measure.py
             if is_master():
-                output_folder = f"{opt.dataset}_preds/"
-                pred_save_dir = os.path.join(opt.val_folder, output_folder)
-                eval_net = ema.ema if (ema is not None) else get_model_module(model)
-
-                # 1. Chạy suy luận & xuất file dự đoán qua eval.py
-                eval(
-                    model=eval_net,
-                    testing_data_loader=testing_data_loader,
-                    model_path=None,
-                    output_folder=pred_save_dir,
-                    class_names=class_names,
-                    device=eval_device,
-                    conf_thres=opt.conf_thres,
-                    iou_thres=opt.iou_thres,
-                    max_det=opt.max_det,
-                    desc="Evaluating Validation Set (EMA, Rank 0)" if (ema is not None) else "Evaluating Validation Set (Rank 0)",
-                )
-
-                # 2. Tính toán và hiển thị các chỉ số đánh giá qua measure.py
                 results = metrics(
                     pred_dir=pred_save_dir,
                     label_dir=val_label_dir,
                     class_names=class_names,
                     dataset_type=opt.dataset,
                     conf_thres=opt.conf_thres,
+                    in_memory_preds=merged_preds,
                 )
 
                 cur_map50 = results["mAP50"]
@@ -776,8 +845,6 @@ if __name__ == "__main__":
                         f"{cur_map50_95:.4f} | {current_lr:.8f} | {note_str} |\n"
                     )
 
-        # Đảm bảo tất cả các GPU đợi GPU 0 hoàn thành eval xong rồi mới chuyển sang epoch tiếp theo
-        if epoch % opt.snapshots == 0 or epoch == opt.nEpochs:
             if dist.is_initialized():
                 dist.barrier()
             if opt.gpu_mode:
@@ -797,7 +864,7 @@ if __name__ == "__main__":
             test_pred_dir = os.path.join(opt.val_folder, f"{opt.dataset}_test_preds")
 
             # 1. Xuất dự đoán trên tập Test qua eval.py
-            eval(
+            test_preds = eval(
                 model=get_model_module(model),
                 testing_data_loader=final_test_data_loader,
                 model_path=final_ckpt,
@@ -807,6 +874,9 @@ if __name__ == "__main__":
                 conf_thres=opt.conf_thres,
                 iou_thres=opt.iou_thres,
                 max_det=opt.max_det,
+                half=(opt.amp and opt.gpu_mode),
+                save_txt=True,
+                return_preds=True,
                 desc="Testing on Test Set (Best Weight, Rank 0)",
             )
 
@@ -817,6 +887,7 @@ if __name__ == "__main__":
                 class_names=class_names,
                 dataset_type=opt.dataset,
                 conf_thres=opt.conf_thres,
+                in_memory_preds=test_preds,
             )
             t_map50 = test_results["mAP50"]
             t_map75 = test_results["mAP75"]

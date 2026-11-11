@@ -177,10 +177,13 @@ def eval(
     vis_dir: Optional[str] = None,
     vis_conf: float = 0.25,
     desc: str = "Evaluating",
-) -> str:
+    return_preds: bool = False,
+    verbose: bool = True,
+):
     """
     Run YOLOv5 inference, NMS, and coordinate rescaling to original image resolution,
-    saving prediction `.txt` files (`<class> <conf> <x1> <y1> <x2> <y2>`) into `output_folder`.
+    optionally saving prediction `.txt` files (`<class> <conf> <x1> <y1> <x2> <y2>`) into `output_folder`
+    and/or returning in-memory predictions (`return_preds=True`) to avoid disk I/O overhead.
     Metric calculation is delegated strictly to `metrics()` in `measure.py`.
     """
     if class_names is None:
@@ -188,13 +191,13 @@ def eval(
 
     if model_path is not None and os.path.exists(model_path):
         load_yolov5_checkpoint(model, model_path, verbose=False)
-        print(f"===> Pre-trained model is loaded from: {model_path}")
+        if verbose:
+            print(f"===> Pre-trained model is loaded from: {model_path}")
 
-    torch.set_grad_enabled(False)
+    was_training = model.training
     model.eval()
-    use_half = half and device.startswith("cuda")
-    if use_half:
-        model.half()
+    is_cuda = str(device).startswith("cuda")
+    use_half = half and is_cuda
 
     if save_txt and output_folder:
         os.makedirs(output_folder, exist_ok=True)
@@ -209,71 +212,89 @@ def eval(
         os.makedirs(vis_dir, exist_ok=True)
 
     total_images = 0
-    total_infer_time = 0.0
+    in_memory_preds: Dict[str, list] = {}
+    iterator = tqdm(testing_data_loader, desc=desc) if verbose else testing_data_loader
 
-    for batch in tqdm(testing_data_loader, desc=desc):
-        imgs, targets, paths, shapes = batch[0], batch[1], batch[2], batch[3]
-        imgs = imgs.to(device, non_blocking=True)
-        if use_half:
-            imgs = imgs.half()
+    if is_cuda:
+        torch.cuda.synchronize()
+    t_start = time.perf_counter()
 
-        if device.startswith("cuda"):
-            torch.cuda.synchronize()
-        t0 = time.perf_counter()
+    with torch.no_grad():
+        for batch in iterator:
+            imgs, targets, paths, shapes = batch[0], batch[1], batch[2], batch[3]
+            imgs = imgs.to(device, non_blocking=True)
 
-        pred_out, _ = model(imgs)
-        dets_batch = non_max_suppression(
-            pred_out.float(),
-            conf_thres=conf_thres,
-            iou_thres=iou_thres,
-            multi_label=(conf_thres <= 0.01),
-            max_det=max_det,
-        )
+            with torch.amp.autocast("cuda", enabled=use_half):
+                pred_out, _ = model(imgs)
 
-        if device.startswith("cuda"):
-            torch.cuda.synchronize()
-        total_infer_time += time.perf_counter() - t0
-        total_images += imgs.shape[0]
+            dets_batch = non_max_suppression(
+                pred_out.float(),
+                conf_thres=conf_thres,
+                iou_thres=iou_thres,
+                multi_label=(conf_thres <= 0.01),
+                max_det=max_det,
+            )
+            total_images += imgs.shape[0]
 
-        for si, det in enumerate(dets_batch):
-            img_path = paths[si]
-            stem = Path(img_path).stem
-            h0, w0 = shapes[si][0]
-            ratio_pad = shapes[si][1]
+            for si, det in enumerate(dets_batch):
+                img_path = paths[si]
+                stem = Path(img_path).stem
+                h0, w0 = shapes[si][0]
+                ratio_pad = shapes[si][1]
 
-            pred_lines = []
-            det_np = np.zeros((0, 6), dtype=np.float32)
-            if len(det):
-                det_clone = det.clone()
-                det_clone[:, :4] = scale_boxes(
-                    imgs.shape[2:],
-                    det_clone[:, :4],
-                    (h0, w0),
-                    ratio_pad=ratio_pad,
-                )
-                det_np = det_clone.cpu().numpy()
-                for *xyxy, conf, cls_id in det_np:
-                    cid = int(cls_id)
-                    score = float(conf)
-                    box = [float(v) for v in xyxy]
-                    cname = class_names[cid] if 0 <= cid < len(class_names) else str(cid)
-                    pred_lines.append(
-                        f"{cname} {score:.6f} {box[0]:.2f} {box[1]:.2f} {box[2]:.2f} {box[3]:.2f}\n"
+                pred_lines = []
+                stem_preds = []
+                det_np = np.zeros((0, 6), dtype=np.float32)
+                if len(det):
+                    det_clone = det.clone()
+                    det_clone[:, :4] = scale_boxes(
+                        imgs.shape[2:],
+                        det_clone[:, :4],
+                        (h0, w0),
+                        ratio_pad=ratio_pad,
+                    )
+                    det_np = det_clone.cpu().numpy()
+                    for row in det_np:
+                        x1, y1, x2, y2, score, cls_id = (
+                            float(row[0]),
+                            float(row[1]),
+                            float(row[2]),
+                            float(row[3]),
+                            float(row[4]),
+                            int(row[5]),
+                        )
+                        if return_preds:
+                            stem_preds.append((cls_id, score, [x1, y1, x2, y2]))
+                        if save_txt and output_folder:
+                            cname = (
+                                class_names[cls_id]
+                                if 0 <= cls_id < len(class_names)
+                                else str(cls_id)
+                            )
+                            pred_lines.append(
+                                f"{cname} {score:.6f} {x1:.2f} {y1:.2f} {x2:.2f} {y2:.2f}\n"
+                            )
+
+                if return_preds:
+                    in_memory_preds[stem] = stem_preds
+
+                if save_txt and output_folder:
+                    with open(
+                        os.path.join(output_folder, f"{stem}.txt"), "w", encoding="utf-8"
+                    ) as pf:
+                        pf.writelines(pred_lines)
+
+                if save_vis and vis_dir:
+                    vis_path = os.path.join(vis_dir, Path(img_path).name)
+                    draw_detections(
+                        img_path, det_np, class_names, vis_path, vis_conf=vis_conf
                     )
 
-            if save_txt and output_folder:
-                with open(
-                    os.path.join(output_folder, f"{stem}.txt"), "w", encoding="utf-8"
-                ) as pf:
-                    pf.writelines(pred_lines)
+    if is_cuda:
+        torch.cuda.synchronize()
+    total_infer_time = time.perf_counter() - t_start
 
-            if save_vis and vis_dir:
-                vis_path = os.path.join(vis_dir, Path(img_path).name)
-                draw_detections(
-                    img_path, det_np, class_names, vis_path, vis_conf=vis_conf
-                )
-
-    if total_images > 0 and total_infer_time > 0:
+    if verbose and total_images > 0 and total_infer_time > 0:
         ms_per_img = (total_infer_time / total_images) * 1000.0
         fps = total_images / total_infer_time
         print(
@@ -281,7 +302,10 @@ def eval(
             f"{ms_per_img:.2f} ms/img | {fps:.2f} FPS (incl. NMS)"
         )
 
-    torch.set_grad_enabled(True)
+    if was_training:
+        model.train()
+    if return_preds:
+        return in_memory_preds
     return output_folder or ""
 
 
@@ -488,7 +512,7 @@ if __name__ == "__main__":
         f"({len(dataset)} images, imgSize={args.imgSize}, device={device})"
     )
 
-    eval(
+    preds_dict = eval(
         model=model,
         testing_data_loader=data_loader,
         model_path=None,
@@ -499,11 +523,12 @@ if __name__ == "__main__":
         iou_thres=args.iou_thres,
         max_det=args.max_det,
         half=args.half,
-        save_txt=True,
+        save_txt=args.save_txt,
         save_vis=args.save_vis,
         vis_dir=vis_dir,
         vis_conf=args.vis_conf,
         desc=f"Testing [{args.split}]",
+        return_preds=True,
     )
 
     # Delegate metric calculation to measure.py
@@ -524,6 +549,7 @@ if __name__ == "__main__":
             dataset_type=ds_name,
             method=args.method,
             conf_thres=args.conf_thres,
+            in_memory_preds=preds_dict,
         )
         if args.save_json:
             os.makedirs(os.path.dirname(os.path.abspath(args.save_json)), exist_ok=True)

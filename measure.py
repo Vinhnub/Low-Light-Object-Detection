@@ -232,38 +232,46 @@ class ObjectDetectionEvaluator:
                     if len(self.ground_truths[img_id][cid]) > 0
                 }
 
-                # Evaluate for each IoU threshold (Eq. 21)
+                # Group prediction indices and boxes by img_id (for images that have GT of this class)
+                pred_indices_per_img = defaultdict(list)
+                pred_boxes_per_img = defaultdict(list)
+                for i, (img_id, _score, pred_box) in enumerate(preds):
+                    if img_id in gt_boxes_per_img:
+                        pred_indices_per_img[img_id].append(i)
+                        pred_boxes_per_img[img_id].append(pred_box)
+
+                # Precompute vectorized IoU matrix (K_preds_in_img x M_gts_in_img) once per image
+                precomputed_img_matches = []
+                for img_id, idxs in pred_indices_per_img.items():
+                    gt_boxes = gt_boxes_per_img[img_id]
+                    p_boxes = np.asarray(pred_boxes_per_img[img_id], dtype=np.float32)
+                    ious_mat = box_iou_numpy(p_boxes, gt_boxes)  # (K, M)
+                    max_idx = np.argmax(ious_mat, axis=1)        # (K,)
+                    max_iou = ious_mat[np.arange(len(idxs)), max_idx]  # (K,)
+                    precomputed_img_matches.append(
+                        (
+                            np.asarray(idxs, dtype=np.int64),
+                            max_idx,
+                            max_iou,
+                            len(gt_boxes),
+                        )
+                    )
+
+                # Evaluate for each IoU threshold (Eq. 21) using precomputed max IoUs
                 for iou_th in self.iou_thresholds:
                     iou_key = round(iou_th, 2)
                     tp = np.zeros(n_preds, dtype=np.float32)
-                    fp = np.zeros(n_preds, dtype=np.float32)
+                    fp = np.ones(n_preds, dtype=np.float32)
 
-                    # Track matched GT flags per image
-                    matched_gt = {
-                        img_id: np.zeros(len(boxes), dtype=bool)
-                        for img_id, boxes in gt_boxes_per_img.items()
-                    }
-
-                    for i, (img_id, score, pred_box) in enumerate(preds):
-                        if img_id not in gt_boxes_per_img:
-                            fp[i] = 1.0
-                            continue
-
-                        gt_boxes = gt_boxes_per_img[img_id]
-                        pred_box_arr = np.array([pred_box], dtype=np.float32)
-
-                        ious = box_iou_numpy(pred_box_arr, gt_boxes)[0]
-                        max_idx = np.argmax(ious) if len(ious) > 0 else -1
-                        max_iou = ious[max_idx] if max_idx >= 0 else 0.0
-
-                        if max_iou >= iou_th:
-                            if not matched_gt[img_id][max_idx]:
-                                tp[i] = 1.0
-                                matched_gt[img_id][max_idx] = True
-                            else:
-                                fp[i] = 1.0  # Duplicate detection on same GT
-                        else:
-                            fp[i] = 1.0
+                    for idxs, max_idx, max_iou, num_gt in precomputed_img_matches:
+                        matched_gt = np.zeros(num_gt, dtype=bool)
+                        for k_i in range(len(idxs)):
+                            if max_iou[k_i] >= iou_th:
+                                g_idx = max_idx[k_i]
+                                if not matched_gt[g_idx]:
+                                    matched_gt[g_idx] = True
+                                    tp[idxs[k_i]] = 1.0
+                                    fp[idxs[k_i]] = 0.0
 
                     # Compute cumulative TP and FP along confidence-sorted predictions
                     cum_tp = np.cumsum(tp, dtype=np.float64)
@@ -587,27 +595,37 @@ def metrics(
     dataset_type="auto",
     method="coco",
     conf_thres=0.001,
+    in_memory_preds=None,
 ):
     """
-    Loads prediction `.txt` files from `pred_dir` and Ground Truth `.txt` files from `label_dir`,
-    computes COCO/VOC mAP (`mAP@0.50`, `mAP@0.75`, `mAP@0.50:0.95`), `Precision@0.50`, `Recall@0.50`,
+    Loads predictions either directly from `in_memory_preds` (fast RAM path) or from `.txt` files
+    in `pred_dir`, and Ground Truth `.txt` files from `label_dir`.
+    Computes COCO/VOC mAP (`mAP@0.50`, `mAP@0.75`, `mAP@0.50:0.95`), `Precision@0.50`, `Recall@0.50`,
     and `F1-Score@0.50`, prints the academic report, and returns the results dictionary.
     """
     evaluator = ObjectDetectionEvaluator(class_names=class_names, method=method)
 
-    # Collect predictions first
-    pred_files = glob.glob(os.path.join(pred_dir, "**", "*.txt"), recursive=True)
-    if not pred_files:
-        pred_files = glob.glob(os.path.join(pred_dir, "*.txt"))
-
     pred_stems = set()
-    for p_path in tqdm(pred_files, desc="Parsing Preds"):
-        stem = _clean_stem(p_path)
-        pred_stems.add(stem)
-        evaluator.image_ids.add(stem)
-        preds = parse_prediction_file(p_path)
-        for c_label, score, box in preds:
-            evaluator.add_prediction(stem, c_label, score, box)
+    if in_memory_preds is not None:
+        for raw_stem, preds in in_memory_preds.items():
+            stem = _clean_stem(raw_stem)
+            pred_stems.add(stem)
+            evaluator.image_ids.add(stem)
+            for c_label, score, box in preds:
+                evaluator.add_prediction(stem, c_label, score, box)
+    else:
+        # Collect predictions from disk .txt files
+        pred_files = glob.glob(os.path.join(pred_dir, "**", "*.txt"), recursive=True)
+        if not pred_files:
+            pred_files = glob.glob(os.path.join(pred_dir, "*.txt"))
+
+        for p_path in tqdm(pred_files, desc="Parsing Preds"):
+            stem = _clean_stem(p_path)
+            pred_stems.add(stem)
+            evaluator.image_ids.add(stem)
+            preds = parse_prediction_file(p_path)
+            for c_label, score, box in preds:
+                evaluator.add_prediction(stem, c_label, score, box)
 
     # Load & cache Ground Truths from label_dir (both in-memory and on-disk .gt_cache.json)
     cache_key = (os.path.abspath(label_dir), str(dataset_type).lower())

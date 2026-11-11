@@ -53,17 +53,29 @@ class ModelEMA:
         )  # decay exponential ramp (to help early epochs)
         for p in self.ema.parameters():
             p.requires_grad_(False)
+        self._cached_model_id: Optional[int] = None
+        self._ema_fp: List[torch.Tensor] = []
+        self._mod_fp: List[torch.Tensor] = []
 
     def update(self, model: nn.Module) -> None:
-        """Update EMA parameters and buffers."""
-        self.updates += 1
-        d = self.decay(self.updates)
-
-        msd = de_parallel(model).state_dict()  # model state_dict
-        for k, v in self.ema.state_dict().items():
-            if v.dtype.is_floating_point:  # true for FP16 and FP32
-                v *= d
-                v += (1.0 - d) * msd[k].detach()
+        """Update EMA parameters and buffers using fused multi-tensor foreach ops."""
+        with torch.no_grad():
+            self.updates += 1
+            d = self.decay(self.updates)
+            raw_m = de_parallel(model)
+            if self._cached_model_id != id(raw_m) or not self._ema_fp:
+                msd = raw_m.state_dict()
+                esd = self.ema.state_dict()
+                self._ema_fp = [
+                    v for k, v in esd.items() if v.dtype.is_floating_point and k in msd
+                ]
+                self._mod_fp = [
+                    msd[k] for k, v in esd.items() if v.dtype.is_floating_point and k in msd
+                ]
+                self._cached_model_id = id(raw_m)
+            if self._ema_fp:
+                torch._foreach_mul_(self._ema_fp, d)
+                torch._foreach_add_(self._ema_fp, self._mod_fp, alpha=1.0 - d)
 
 
 def smart_optimizer(
