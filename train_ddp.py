@@ -95,8 +95,8 @@ def train_init() -> int:
             torch.cuda.set_device(0)
 
     seed_torch()
-    cudnn.benchmark = False
-    cudnn.deterministic = True
+    cudnn.benchmark = True
+    cudnn.deterministic = False
     cuda = opt.gpu_mode
     if cuda and not torch.cuda.is_available():
         raise Exception("No GPU found, please run without --gpu_mode False")
@@ -489,8 +489,8 @@ def build_model(local_rank: int, num_classes: int):
 
     # Đồng bộ BatchNorm và bọc model bằng DistributedDataParallel khi chạy đa GPU
     if dist.is_initialized():
-        if get_world_size() > 1:
-            net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(net).to(local_rank)
+        # if get_world_size() > 1:
+        #     net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(net).to(local_rank)
         if is_master():
             print(f"===> Sử dụng DistributedDataParallel (DDP) trên {get_world_size()} GPUs!")
         net = DDP(
