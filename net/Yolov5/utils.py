@@ -4,6 +4,7 @@ structural re-parameterization (Conv+BN fusion), bounding box conversion,
 and Non-Maximum Suppression (NMS).
 """
 
+import copy
 import math
 import os
 import sys
@@ -17,6 +18,113 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
+
+
+def is_parallel(model: nn.Module) -> bool:
+    """Returns True if model is of type DP or DDP."""
+    return isinstance(
+        model, (nn.parallel.DataParallel, nn.parallel.DistributedDataParallel)
+    )
+
+
+def de_parallel(model: nn.Module) -> nn.Module:
+    """De-parallelize a model: returns single-GPU model if model is of type DP or DDP."""
+    return model.module if is_parallel(model) else model
+
+
+class ModelEMA:
+    """
+    Updated Exponential Moving Average (EMA) from Ultralytics YOLOv5.
+    Keeps a moving average of everything in the model state_dict (parameters and buffers).
+    For EMA details see https://www.tensorflow.org/api_docs/python/tf/train/ExponentialMovingAverage
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        decay: float = 0.9999,
+        tau: float = 2000.0,
+        updates: int = 0,
+    ):
+        self.ema = copy.deepcopy(de_parallel(model)).eval()  # FP32 EMA
+        self.updates = updates  # number of EMA updates
+        self.decay = lambda x: decay * (
+            1.0 - math.exp(-x / tau)
+        )  # decay exponential ramp (to help early epochs)
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+
+    def update(self, model: nn.Module) -> None:
+        """Update EMA parameters and buffers."""
+        self.updates += 1
+        d = self.decay(self.updates)
+
+        msd = de_parallel(model).state_dict()  # model state_dict
+        for k, v in self.ema.state_dict().items():
+            if v.dtype.is_floating_point:  # true for FP16 and FP32
+                v *= d
+                v += (1.0 - d) * msd[k].detach()
+
+
+def smart_optimizer(
+    model: nn.Module,
+    name: str = "Adam",
+    lr: float = 1e-4,
+    momentum: float = 0.937,
+    decay: float = 5e-5,
+    verbose: bool = True,
+) -> torch.optim.Optimizer:
+    """
+    Ultralytics YOLOv5 3-group smart optimizer:
+      - g0: BatchNorm weights (no weight_decay)
+      - g1: Conv / Linear weights (with weight_decay)
+      - g2: Biases (no weight_decay)
+    Prevents weight_decay from shrinking BatchNorm scale (gamma) and Detect head biases.
+    """
+    g = [], [], []  # optimizer parameter groups: [g0 (bn), g1 (weights), g2 (biases)]
+    bn = tuple(
+        v for k, v in nn.__dict__.items() if "Norm" in k
+    )  # normalization layers, i.e. BatchNorm2d()
+    for v in de_parallel(model).modules():
+        if hasattr(v, "bias") and isinstance(
+            v.bias, nn.Parameter
+        ):  # bias (no decay)
+            g[2].append(v.bias)
+        if isinstance(v, bn):  # weight (no decay)
+            g[0].append(v.weight)
+        elif hasattr(v, "weight") and isinstance(
+            v.weight, nn.Parameter
+        ):  # weight (with decay)
+            g[1].append(v.weight)
+
+    opt_name = name.upper()
+    if opt_name == "ADAM":
+        optimizer = torch.optim.Adam(
+            g[2], lr=lr, betas=(momentum, 0.999)
+        )  # adjust beta1 to momentum
+    elif opt_name == "ADAMW":
+        optimizer = torch.optim.AdamW(
+            g[2], lr=lr, betas=(momentum, 0.999), weight_decay=0.0
+        )
+    elif opt_name == "SGD":
+        optimizer = torch.optim.SGD(
+            g[2], lr=lr, momentum=momentum, nesterov=True
+        )
+    else:
+        raise NotImplementedError(f"Optimizer {name} not implemented.")
+
+    optimizer.add_param_group(
+        {"params": g[1], "weight_decay": decay}
+    )  # add g1 with weight_decay
+    optimizer.add_param_group(
+        {"params": g[0], "weight_decay": 0.0}
+    )  # add g0 (BatchNorm) without weight_decay
+    if verbose:
+        print(
+            f"===> Optimizer: {type(optimizer).__name__}(lr={lr}, momentum={momentum}) with parameter groups: "
+            f"{len(g[0])} weight(decay=0.0), {len(g[1])} weight(decay={decay}), {len(g[2])} bias(decay=0.0)"
+        )
+    return optimizer
 
 
 PRETRAINED_URLS: Dict[str, str] = {

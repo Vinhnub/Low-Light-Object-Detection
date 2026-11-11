@@ -20,7 +20,7 @@ def option():
     parser.add_argument(
         "--model",
         type=str,
-        default="yolov5n",
+        default="yolov5s",
         choices=["yolov5n", "yolov5s", "yolov5m", "yolov5l", "yolov5x"],
         help="YOLOv5 model variant (default: %(default)s)",
     )
@@ -68,8 +68,8 @@ def option():
         "--nEpochs",
         "--epochs",
         type=int,
-        default=100,
-        help="number of epochs to train for end",
+        default=300,
+        help="Target final epoch to stop training (e.g., if start_epoch=20 and nEpochs=100, trains from epoch 21 to 100)",
     )
     parser.add_argument(
         "--start_epoch",
@@ -86,13 +86,13 @@ def option():
     parser.add_argument(
         "--lr",
         type=float,
-        default=5e-4,
+        default=1e-4,
         help="Initial learning rate (1e-2 for SGD, 1e-3 for Adam/AdamW)",
     )
     parser.add_argument(
         "--lrf",
         type=float,
-        default=0.01,
+        default=0.001,
         help="Final OneCycleLR learning rate fraction (lr * lrf)",
     )
     parser.add_argument(
@@ -111,7 +111,7 @@ def option():
     parser.add_argument(
         "--weight_decay",
         type=float,
-        default=5e-4,
+        default=5e-5,
         help="Optimizer weight decay",
     )
     parser.add_argument("--gpu_mode", type=_str2bool, default=True)
@@ -138,7 +138,7 @@ def option():
     # 2. Scheduler & Warmup settings
     parser.add_argument("--cos_restart_cyclic", type=_str2bool, default=False)
     parser.add_argument("--cos_restart", type=_str2bool, default=True)
-    parser.add_argument("--warmup_epochs", type=int, default=0, help="warmup_epochs")
+    parser.add_argument("--warmup_epochs", type=int, default=3, help="warmup_epochs")
     parser.add_argument(
         "--start_warmup",
         type=_str2bool,
@@ -223,6 +223,38 @@ def option():
         type=str,
         default="./dataset/custom/images/val",
         help="Custom validation images directory",
+    )
+
+    # Validation / Test Ground Truth label directories (for measure.py)
+    parser.add_argument(
+        "--data_valgt_exdark",
+        type=str,
+        default="./dataset/ExDark/labels_raw/val",
+        help="ExDark validation ground truth labels directory",
+    )
+    parser.add_argument(
+        "--data_testgt_exdark",
+        type=str,
+        default="./dataset/ExDark/labels_raw/test",
+        help="ExDark test ground truth labels directory",
+    )
+    parser.add_argument(
+        "--data_valgt_darkface",
+        type=str,
+        default="./dataset/DarkFace/label",
+        help="DarkFace ground truth labels directory",
+    )
+    parser.add_argument(
+        "--data_valgt_voc",
+        type=str,
+        default="./dataset/VOC/labels/val",
+        help="VOC validation ground truth labels directory",
+    )
+    parser.add_argument(
+        "--data_valgt_custom",
+        type=str,
+        default="./dataset/custom/labels/val",
+        help="Custom validation ground truth labels directory",
     )
 
     parser.add_argument(

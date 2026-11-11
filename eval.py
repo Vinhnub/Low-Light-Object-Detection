@@ -29,12 +29,8 @@ from data.data import (
     get_exdark_val_set,
 )
 from data.dataset import YOLODataset, collate_fn
-from data.util import DARKFACE_CLASSES, EXDARK_CLASSES, xywhn2xyxy
-from measure import (
-    VOC_CLASSES,
-    ObjectDetectionEvaluator,
-    print_academic_report,
-)
+from data.util import DARKFACE_CLASSES, EXDARK_CLASSES
+from measure import VOC_CLASSES, metrics
 from net.Yolov5 import (
     DetectionModel,
     load_yolov5_checkpoint,
@@ -175,26 +171,24 @@ def eval(
     conf_thres: float = 0.001,
     iou_thres: float = 0.6,
     max_det: int = 300,
-    method: str = "coco",
     half: bool = False,
     save_txt: bool = True,
     save_vis: bool = False,
     vis_dir: Optional[str] = None,
     vis_conf: float = 0.25,
     desc: str = "Evaluating",
-) -> Dict:
+) -> str:
     """
-    Unified evaluation function for both `train.py`/`train_ddp.py` and standalone `eval.py`.
-    Runs YOLOv5 inference, NMS, coordinate rescaling to original image resolution,
-    exports prediction `.txt` files (and optional visualizations), and computes
-    `mAP@0.50`, `mAP@0.75`, `mAP@0.50:0.95` via `ObjectDetectionEvaluator` in `measure.py`.
+    Run YOLOv5 inference, NMS, and coordinate rescaling to original image resolution,
+    saving prediction `.txt` files (`<class> <conf> <x1> <y1> <x2> <y2>`) into `output_folder`.
+    Metric calculation is delegated strictly to `metrics()` in `measure.py`.
     """
     if class_names is None:
         class_names = EXDARK_CLASSES
 
     if model_path is not None and os.path.exists(model_path):
         load_yolov5_checkpoint(model, model_path, verbose=False)
-        print(f"===> Loaded checkpoint for evaluation: {model_path}")
+        print(f"===> Pre-trained model is loaded from: {model_path}")
 
     torch.set_grad_enabled(False)
     model.eval()
@@ -202,10 +196,15 @@ def eval(
     if use_half:
         model.half()
 
-    evaluator = ObjectDetectionEvaluator(class_names=class_names, method=method)
-
     if save_txt and output_folder:
         os.makedirs(output_folder, exist_ok=True)
+        # Clear previous .txt prediction files in output_folder so splits/epochs never mix
+        for old_f in os.listdir(output_folder):
+            if old_f.endswith(".txt"):
+                try:
+                    os.remove(os.path.join(output_folder, old_f))
+                except OSError:
+                    pass
     if save_vis and vis_dir:
         os.makedirs(vis_dir, exist_ok=True)
 
@@ -227,6 +226,7 @@ def eval(
             pred_out.float(),
             conf_thres=conf_thres,
             iou_thres=iou_thres,
+            multi_label=(conf_thres <= 0.01),
             max_det=max_det,
         )
 
@@ -240,24 +240,6 @@ def eval(
             stem = Path(img_path).stem
             h0, w0 = shapes[si][0]
             ratio_pad = shapes[si][1]
-
-            # Add Ground Truth boxes rescaled to original pixel dimensions
-            t_si = targets[targets[:, 0] == si]
-            if len(t_si):
-                t_np = t_si[:, 1:].cpu().numpy()
-                t_xyxy = xywhn2xyxy(
-                    t_np[:, 1:5], w=imgs.shape[3], h=imgs.shape[2]
-                )
-                t_xyxy_orig = scale_boxes(
-                    imgs.shape[2:],
-                    torch.from_numpy(t_xyxy),
-                    (h0, w0),
-                    ratio_pad=ratio_pad,
-                ).numpy()
-                for cid, box in zip(t_np[:, 0].astype(int), t_xyxy_orig):
-                    evaluator.add_ground_truth(stem, int(cid), box.tolist())
-            else:
-                evaluator.image_ids.add(stem)
 
             pred_lines = []
             det_np = np.zeros((0, 6), dtype=np.float32)
@@ -274,7 +256,6 @@ def eval(
                     cid = int(cls_id)
                     score = float(conf)
                     box = [float(v) for v in xyxy]
-                    evaluator.add_prediction(stem, cid, score, box)
                     cname = class_names[cid] if 0 <= cid < len(class_names) else str(cid)
                     pred_lines.append(
                         f"{cname} {score:.6f} {box[0]:.2f} {box[1]:.2f} {box[2]:.2f} {box[3]:.2f}\n"
@@ -292,21 +273,16 @@ def eval(
                     img_path, det_np, class_names, vis_path, vis_conf=vis_conf
                 )
 
-    torch.set_grad_enabled(True)
-    results = evaluator.evaluate(conf_threshold=conf_thres)
-    print_academic_report(results, class_names)
-
     if total_images > 0 and total_infer_time > 0:
         ms_per_img = (total_infer_time / total_images) * 1000.0
         fps = total_images / total_infer_time
         print(
-            f"===> Inference Speed ({total_images} images): "
+            f"===> End evaluation ({total_images} images): "
             f"{ms_per_img:.2f} ms/img | {fps:.2f} FPS (incl. NMS)"
         )
-        results["speed_ms_per_img"] = ms_per_img
-        results["fps"] = fps
 
-    return results
+    torch.set_grad_enabled(True)
+    return output_folder or ""
 
 
 # Backward-compatible aliases
@@ -504,7 +480,7 @@ if __name__ == "__main__":
     )
 
     out_root = args.output_dir or os.path.join("results", "eval", f"{ds_name}_{args.split}")
-    pred_dir = os.path.join(out_root, "preds") if args.save_txt else None
+    pred_dir = os.path.join(out_root, "preds")
     vis_dir = os.path.join(out_root, "visualized") if args.save_vis else None
 
     print(
@@ -512,7 +488,7 @@ if __name__ == "__main__":
         f"({len(dataset)} images, imgSize={args.imgSize}, device={device})"
     )
 
-    results = eval(
+    eval(
         model=model,
         testing_data_loader=data_loader,
         model_path=None,
@@ -522,17 +498,35 @@ if __name__ == "__main__":
         conf_thres=args.conf_thres,
         iou_thres=args.iou_thres,
         max_det=args.max_det,
-        method=args.method,
         half=args.half,
-        save_txt=args.save_txt,
+        save_txt=True,
         save_vis=args.save_vis,
         vis_dir=vis_dir,
         vis_conf=args.vis_conf,
         desc=f"Testing [{args.split}]",
     )
 
-    if args.save_json:
-        os.makedirs(os.path.dirname(os.path.abspath(args.save_json)), exist_ok=True)
-        with open(args.save_json, "w", encoding="utf-8") as jf:
-            json.dump(results, jf, indent=4)
-        print(f"===> Evaluation JSON saved to: {args.save_json}")
+    # Delegate metric calculation to measure.py
+    if ds_name == "exdark":
+        gt_dir = f"./dataset/ExDark/labels_raw/{args.split}"
+    elif ds_name == "darkface":
+        gt_dir = "./dataset/DarkFace/label"
+    elif ds_name == "voc":
+        gt_dir = f"./dataset/VOC/labels/{args.split}"
+    else:
+        gt_dir = f"./dataset/custom/labels/{args.split}"
+
+    if os.path.exists(gt_dir):
+        results = metrics(
+            pred_dir=pred_dir,
+            label_dir=gt_dir,
+            class_names=class_names,
+            dataset_type=ds_name,
+            method=args.method,
+            conf_thres=args.conf_thres,
+        )
+        if args.save_json:
+            os.makedirs(os.path.dirname(os.path.abspath(args.save_json)), exist_ok=True)
+            with open(args.save_json, "w", encoding="utf-8") as jf:
+                json.dump(results, jf, indent=4)
+            print(f"===> Evaluation JSON saved to: {args.save_json}")

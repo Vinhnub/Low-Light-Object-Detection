@@ -31,16 +31,20 @@ from .common import (
 )
 from .utils import (
     PRETRAINED_URLS,
+    ModelEMA,
     box_iou,
     check_anchor_order,
     clip_boxes,
+    de_parallel,
     fuse_conv_and_bn,
     initialize_weights,
+    is_parallel,
     load_yolov5_checkpoint,
     make_divisible,
     non_max_suppression,
     scale_boxes,
     scale_img,
+    smart_optimizer,
     xywh2xyxy,
     xyxy2xywh,
 )
@@ -115,6 +119,10 @@ __all__ = [
     "yolov5l",
     "yolov5x",
     # Utilities & Post-processing
+    "ModelEMA",
+    "smart_optimizer",
+    "is_parallel",
+    "de_parallel",
     "make_divisible",
     "initialize_weights",
     "fuse_conv_and_bn",

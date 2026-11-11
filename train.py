@@ -18,12 +18,14 @@ from data.scheduler import *
 from data.util import DARKFACE_CLASSES, EXDARK_CLASSES, xywhn2xyxy
 from eval import eval
 from loss.losses import *
-from measure import VOC_CLASSES
+from measure import VOC_CLASSES, metrics
 from net.Yolov5 import (
     DetectionModel,
+    ModelEMA,
     YOLOv5,
     load_yolov5_checkpoint,
     non_max_suppression,
+    smart_optimizer,
     yolov5l,
     yolov5m,
     yolov5n,
@@ -99,10 +101,11 @@ def save_training_visual_sample(img_tensor, targets_tensor, preds_raw, class_nam
 
     # 2. Draw Predicted boxes on test.png (run quick eval forward on first image)
     pred_img = img_bgr.copy()
-    was_training = model.training
-    model.eval()
+    vis_model = ema.ema if (ema is not None) else model
+    was_training = vis_model.training
+    vis_model.eval()
     with torch.no_grad():
-        pred_out, _ = model(img_tensor[0:1])
+        pred_out, _ = vis_model(img_tensor[0:1])
         dets = non_max_suppression(pred_out, conf_thres=0.25, iou_thres=0.45)[0]
         for *xyxy, conf, cls_id in dets.cpu().numpy():
             x1, y1, x2, y2 = xyxy
@@ -120,12 +123,18 @@ def save_training_visual_sample(img_tensor, targets_tensor, preds_raw, class_nam
                 1,
             )
     if was_training:
-        model.train()
+        vis_model.train()
     cv2.imwrite(os.path.join(save_dir, "test.png"), pred_img)
 
 
 def train(epoch):
     model.train()
+    # Disable mosaic in the final 15 epochs to align training with real un-mosaicked validation images
+    if hasattr(training_data_loader, "dataset") and hasattr(training_data_loader.dataset, "mosaic"):
+        if epoch > max(1, opt.nEpochs - 15) and training_data_loader.dataset.mosaic:
+            print(f"===> [Epoch {epoch}] Closing Mosaic augmentation for final fine-tuning.")
+            training_data_loader.dataset.mosaic = False
+
     loss_print = 0.0
     pic_cnt = 0
     loss_last_10 = 0.0
@@ -140,7 +149,7 @@ def train(epoch):
     iter_cnt = 0
     torch.autograd.set_detect_anomaly(opt.grad_detect)
 
-    pbar = tqdm(training_data_loader, desc=f"Epoch [{epoch}/{opt.nEpochs + opt.start_epoch}]")
+    pbar = tqdm(training_data_loader, desc=f"Epoch [{epoch}/{opt.nEpochs}]")
     for batch in pbar:
         imgs, targets, paths, shapes = batch[0], batch[1], batch[2], batch[3]
         if opt.gpu_mode:
@@ -171,6 +180,9 @@ def train(epoch):
             if opt.grad_clip:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0, norm_type=2)
             optimizer.step()
+
+        if ema is not None:
+            ema.update(model)
 
         # loss_items = [lbox, lobj, lcls]
         lbox_val = loss_items[0].item()
@@ -235,19 +247,26 @@ def checkpoint(epoch, lr=None, tag=None):
     os.makedirs("./weights", exist_ok=True)
     os.makedirs(opt.save_folder, exist_ok=True)
 
-    filename = f"epoch_{epoch}.pth" if tag is None else f"epoch_{epoch}_{tag}.pth"
+    filename = f"epoch_{epoch}.pth" if tag is None else f"{tag}.pth"
     model_out_path = os.path.join(opt.save_folder, filename)
     current_lr = lr if lr is not None else optimizer.param_groups[0]["lr"]
+    eval_model = ema.ema if (ema is not None) else model
     checkpoint_dict = {
         "epoch": epoch,
         "model_name": opt.model,
         "num_classes": len(class_names),
-        "state_dict": model.state_dict(),
+        "state_dict": eval_model.state_dict(),
+        "model_state_dict": model.state_dict(),
+        "ema_updates": ema.updates if (ema is not None) else 0,
         "lr": current_lr,
         "optimizer": optimizer.state_dict(),
     }
     torch.save(checkpoint_dict, model_out_path)
-    print("Checkpoint saved to {} (lr: {:.8f})".format(model_out_path, current_lr))
+    print(
+        "Checkpoint saved to {} (epoch: {}, lr: {:.8f})".format(
+            model_out_path, epoch, current_lr
+        )
+    )
     return model_out_path
 
 
@@ -371,26 +390,17 @@ def build_model(num_classes: int):
 
 def make_scheduler(lr=None):
     train_lr = lr if lr is not None else opt.lr
-    opt_type = opt.optimizer.upper()
-    if opt_type == "ADAM":
-        optimizer = optim.Adam(
-            model.parameters(), lr=train_lr, weight_decay=opt.weight_decay
-        )
-    elif opt_type == "ADAMW":
-        optimizer = optim.AdamW(
-            model.parameters(), lr=train_lr, weight_decay=opt.weight_decay
-        )
-    else:
-        optimizer = optim.SGD(
-            model.parameters(),
-            lr=train_lr,
-            momentum=opt.momentum,
-            weight_decay=opt.weight_decay,
-            nesterov=True,
-        )
+    optimizer = smart_optimizer(
+        model,
+        name=opt.optimizer,
+        lr=train_lr,
+        momentum=opt.momentum,
+        decay=opt.weight_decay,
+        verbose=True,
+    )
 
     if opt.cos_restart_cyclic:
-        if opt.start_warmup and opt.start_epoch == 0:
+        if opt.start_warmup and opt.warmup_epochs > 0 and opt.start_epoch == 0:
             scheduler_step = CosineAnnealingRestartCyclicLR(
                 optimizer=optimizer,
                 periods=[
@@ -407,14 +417,18 @@ def make_scheduler(lr=None):
                 after_scheduler=scheduler_step,
             )
         else:
+            remaining_epochs = max(1, opt.nEpochs - opt.start_epoch)
             scheduler = CosineAnnealingRestartCyclicLR(
                 optimizer=optimizer,
-                periods=[max(1, opt.nEpochs // 4), max(1, (opt.nEpochs * 3) // 4)],
+                periods=[
+                    max(1, remaining_epochs // 4),
+                    max(1, remaining_epochs - (remaining_epochs // 4)),
+                ],
                 restart_weights=[1, 1],
                 eta_mins=[train_lr * 0.1, train_lr * 1e-4],
             )
     elif opt.cos_restart:
-        if opt.start_warmup and opt.start_epoch == 0:
+        if opt.start_warmup and opt.warmup_epochs > 0 and opt.start_epoch == 0:
             scheduler_step = CosineAnnealingRestartLR(
                 optimizer=optimizer,
                 periods=[max(1, opt.nEpochs - opt.warmup_epochs)],
@@ -496,6 +510,19 @@ if __name__ == "__main__":
 
     criterion = init_loss()
     scaler = torch.amp.GradScaler("cuda", enabled=(opt.amp and opt.gpu_mode))
+    ema = ModelEMA(model) if opt.ema else None
+    if (
+        ema is not None
+        and checkpoint_data is not None
+        and isinstance(checkpoint_data, dict)
+        and (opt.start_epoch > 0 or opt.resume)
+    ):
+        if "state_dict" in checkpoint_data:
+            ema.ema.load_state_dict(checkpoint_data["state_dict"], strict=False)
+        if "model_state_dict" in checkpoint_data:
+            model.load_state_dict(checkpoint_data["model_state_dict"], strict=False)
+        ema.updates = int(checkpoint_data.get("ema_updates", 0))
+        print(f"===> Đã khôi phục trạng thái ModelEMA (updates={ema.updates})")
 
     """
     2. Training & Evaluation Loop
@@ -503,7 +530,10 @@ if __name__ == "__main__":
     map50_history = []
     map75_history = []
     map50_95_history = []
+    best_precision = 0.0
+    best_recall = 0.0
     best_map50 = 0.0
+    best_map75 = 0.0
     best_map50_95 = 0.0
     best_model_path = None
     last_model_path = None
@@ -534,30 +564,57 @@ if __name__ == "__main__":
         f.write("|---|---|---|---|---|---|---|---|---|---|---|---|\n")
 
     eval_device = "cuda" if opt.gpu_mode else "cpu"
+    if opt.dataset == "exdark":
+        val_label_dir = opt.data_valgt_exdark
+        test_label_dir = (
+            opt.data_testgt_exdark
+            if os.path.exists(opt.data_testgt_exdark)
+            else opt.data_valgt_exdark
+        )
+    elif opt.dataset == "darkface":
+        val_label_dir = opt.data_valgt_darkface
+        test_label_dir = opt.data_valgt_darkface
+    elif opt.dataset == "voc":
+        val_label_dir = opt.data_valgt_voc
+        test_label_dir = opt.data_valgt_voc
+    else:
+        val_label_dir = opt.data_valgt_custom
+        test_label_dir = opt.data_valgt_custom
 
-    for epoch in range(start_epoch + 1, opt.nEpochs + start_epoch + 1):
+    for epoch in range(start_epoch + 1, opt.nEpochs + 1):
         current_lr = optimizer.param_groups[0]["lr"]
         epoch_loss, pic_num, detailed_losses = train(epoch)
         scheduler.step()
 
-        if epoch % opt.snapshots == 0 or epoch == (opt.nEpochs + start_epoch):
+        if epoch % opt.snapshots == 0 or epoch == opt.nEpochs:
             model_out_path = checkpoint(epoch, lr=current_lr)
             last_model_path = model_out_path
 
             output_folder = f"{opt.dataset}_preds/"
             pred_save_dir = os.path.join(opt.val_folder, output_folder)
+            eval_net = ema.ema if (ema is not None) else model
 
-            results = eval(
-                model=model,
+            # 1. Chạy suy luận & xuất file dự đoán qua eval.py (sử dụng trọng số EMA nếu bật)
+            eval(
+                model=eval_net,
                 testing_data_loader=testing_data_loader,
-                model_path=model_out_path,
+                model_path=None,
                 output_folder=pred_save_dir,
                 class_names=class_names,
                 device=eval_device,
                 conf_thres=opt.conf_thres,
                 iou_thres=opt.iou_thres,
                 max_det=opt.max_det,
-                desc="Evaluating Validation Set",
+                desc="Evaluating Validation Set (EMA)" if (ema is not None) else "Evaluating Validation Set",
+            )
+
+            # 2. Tính toán và hiển thị các chỉ số đánh giá qua measure.py
+            results = metrics(
+                pred_dir=pred_save_dir,
+                label_dir=val_label_dir,
+                class_names=class_names,
+                dataset_type=opt.dataset,
+                conf_thres=opt.conf_thres,
             )
 
             cur_map50 = results["mAP50"]
@@ -566,21 +623,27 @@ if __name__ == "__main__":
             cur_p = results["mean_precision"]
             cur_r = results["mean_recall"]
 
-            print("===> Avg.Precision@0.50: {:.4f}".format(cur_p))
-            print("===> Avg.Recall@0.50:    {:.4f}".format(cur_r))
-            print("===> mAP@0.50:           {:.4f} ({:.2f}%)".format(cur_map50, cur_map50 * 100))
-            print("===> mAP@0.75:           {:.4f} ({:.2f}%)".format(cur_map75, cur_map75 * 100))
-            print("===> mAP@0.50:0.95:      {:.4f} ({:.2f}%)".format(cur_map50_95, cur_map50_95 * 100))
-
             map50_history.append(cur_map50)
             map75_history.append(cur_map75)
             map50_95_history.append(cur_map50_95)
 
             note_list = []
+            if cur_p > best_precision:
+                best_precision = cur_p
+                checkpoint(epoch, lr=current_lr, tag="best_Precision")
+                note_list.append("Best Precision")
+            if cur_r > best_recall:
+                best_recall = cur_r
+                checkpoint(epoch, lr=current_lr, tag="best_Recall")
+                note_list.append("Best Recall")
             if cur_map50 > best_map50:
                 best_map50 = cur_map50
                 best_model_path = checkpoint(epoch, lr=current_lr, tag="best_mAP50")
                 note_list.append("Best mAP@0.50")
+            if cur_map75 > best_map75:
+                best_map75 = cur_map75
+                checkpoint(epoch, lr=current_lr, tag="best_mAP75")
+                note_list.append("Best mAP@0.75")
             if cur_map50_95 > best_map50_95:
                 best_map50_95 = cur_map50_95
                 checkpoint(epoch, lr=current_lr, tag="best_mAP50_95")
@@ -607,7 +670,9 @@ if __name__ == "__main__":
         print(f"===> [Final Test] Tự động đánh giá tập TEST với weight tốt nhất: {final_ckpt}")
         print("=" * 95)
         test_pred_dir = os.path.join(opt.val_folder, f"{opt.dataset}_test_preds")
-        test_results = eval(
+
+        # 1. Xuất dự đoán trên tập Test qua eval.py
+        eval(
             model=model,
             testing_data_loader=final_test_data_loader,
             model_path=final_ckpt,
@@ -619,16 +684,20 @@ if __name__ == "__main__":
             max_det=opt.max_det,
             desc="Testing on Test Set (Best Weight)",
         )
+
+        # 2. Tính toán metrics trên tập Test qua measure.py
+        test_results = metrics(
+            pred_dir=test_pred_dir,
+            label_dir=test_label_dir,
+            class_names=class_names,
+            dataset_type=opt.dataset,
+            conf_thres=opt.conf_thres,
+        )
         t_map50 = test_results["mAP50"]
         t_map75 = test_results["mAP75"]
         t_map50_95 = test_results["mAP50_95"]
         t_p = test_results["mean_precision"]
         t_r = test_results["mean_recall"]
-        print("===> [TEST SET] Avg.Precision@0.50: {:.4f}".format(t_p))
-        print("===> [TEST SET] Avg.Recall@0.50:    {:.4f}".format(t_r))
-        print("===> [TEST SET] mAP@0.50:           {:.4f} ({:.2f}%)".format(t_map50, t_map50 * 100))
-        print("===> [TEST SET] mAP@0.75:           {:.4f} ({:.2f}%)".format(t_map75, t_map75 * 100))
-        print("===> [TEST SET] mAP@0.50:0.95:      {:.4f} ({:.2f}%)".format(t_map50_95, t_map50_95 * 100))
         with open(metrics_md_path, "a", encoding="utf-8") as f:
             f.write(
                 f"| **Test (Best)** | - | - | - | - | "

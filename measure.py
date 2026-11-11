@@ -179,38 +179,51 @@ class ObjectDetectionEvaluator:
                 return v
         return None
 
-    def evaluate(self, conf_threshold=0.001):
+    def evaluate(self, conf_threshold=0.001, score_threshold=None):
         """
-        Run the academic evaluation protocol.
+        Run the academic evaluation protocol following LLEYOLO / COCO formulas:
+          - Eq. (18): Precision = TP / (TP + FP)
+          - Eq. (19): Recall    = TP / (TP + FN)
+          - Eq. (20): mAP       = (1 / N) * sum_{n=1}^{N} AP(n)
+          - Eq. (21): IoU       = Area(A n B) / Area(A u B)
+
         Returns:
             dict containing:
-              - per_class: dict of {class_name: {ap50, ap75, ap50_95, precision, recall, targets, preds}}
-              - mAP50, mAP75, mAP50_95, mean_precision, mean_recall
+              - per_class: dict of {class_name: {targets, preds, tp, fp, fn, precision, recall, f1, ap50, ap75, ap50_95}}
+              - total_tp, total_fp, total_fn
+              - mAP50, mAP75, mAP50_95, mean_precision, mean_recall, mean_f1
         """
         results_per_class = {}
         all_aps = {round(iou, 2): [] for iou in self.iou_thresholds}
 
+        # Store raw sorted scores, cumulative TP, and cumulative FP at IoU=0.50 per class
+        class_pr_data_50 = {}
+
         for cid, class_name in enumerate(self.class_names):
-            # Count total ground truth boxes for this class
+            # Total positive samples (TP + FN) for this class
             n_gt = sum(len(self.ground_truths[img_id][cid]) for img_id in self.image_ids)
 
-            # Filter predictions by confidence
+            # Filter predictions by minimum confidence threshold
             preds = [p for p in self.predictions[cid] if p[1] >= conf_threshold]
             n_preds = len(preds)
 
             # Sort predictions by confidence in descending order
             preds.sort(key=lambda x: x[1], reverse=True)
+            scores_sorted = (
+                np.array([p[1] for p in preds], dtype=np.float64)
+                if n_preds > 0
+                else np.array([], dtype=np.float64)
+            )
 
             ap_per_iou = {}
-            prec_at_50 = 0.0
-            rec_at_50 = 0.0
 
-            if n_gt == 0:
+            if n_gt == 0 or n_preds == 0:
                 for iou_th in self.iou_thresholds:
                     ap_per_iou[round(iou_th, 2)] = 0.0
-            elif n_preds == 0:
-                for iou_th in self.iou_thresholds:
-                    ap_per_iou[round(iou_th, 2)] = 0.0
+                # If n_gt == 0 but predictions exist, all predictions are FP
+                cum_tp_50 = np.zeros(n_preds, dtype=np.float64)
+                cum_fp_50 = np.arange(1, n_preds + 1, dtype=np.float64)
+                class_pr_data_50[class_name] = (scores_sorted, cum_tp_50, cum_fp_50, n_gt)
             else:
                 # Group GTs per image for fast lookup
                 gt_boxes_per_img = {
@@ -219,7 +232,7 @@ class ObjectDetectionEvaluator:
                     if len(self.ground_truths[img_id][cid]) > 0
                 }
 
-                # Evaluate for each IoU threshold
+                # Evaluate for each IoU threshold (Eq. 21)
                 for iou_th in self.iou_thresholds:
                     iou_key = round(iou_th, 2)
                     tp = np.zeros(n_preds, dtype=np.float32)
@@ -252,10 +265,12 @@ class ObjectDetectionEvaluator:
                         else:
                             fp[i] = 1.0
 
-                    # Compute precision-recall curve
-                    cum_tp = np.cumsum(tp)
-                    cum_fp = np.cumsum(fp)
+                    # Compute cumulative TP and FP along confidence-sorted predictions
+                    cum_tp = np.cumsum(tp, dtype=np.float64)
+                    cum_fp = np.cumsum(fp, dtype=np.float64)
+                    # Eq. (19): Recall = TP / (TP + FN) where TP + FN = n_gt
                     recalls = cum_tp / n_gt
+                    # Eq. (18): Precision = TP / (TP + FP)
                     precisions = cum_tp / np.maximum(cum_tp + cum_fp, np.finfo(np.float64).eps)
 
                     if self.method == "voc":
@@ -266,10 +281,8 @@ class ObjectDetectionEvaluator:
                     ap_per_iou[iou_key] = ap
 
                     if abs(iou_th - 0.50) < 1e-4:
-                        prec_at_50 = float(precisions[-1]) if len(precisions) > 0 else 0.0
-                        rec_at_50 = float(recalls[-1]) if len(recalls) > 0 else 0.0
+                        class_pr_data_50[class_name] = (scores_sorted, cum_tp, cum_fp, n_gt)
 
-            # Store per-class results
             ap50 = ap_per_iou.get(0.50, 0.0)
             ap75 = ap_per_iou.get(0.75, 0.0)
             ap50_95 = float(np.mean(list(ap_per_iou.values())))
@@ -280,28 +293,103 @@ class ObjectDetectionEvaluator:
             results_per_class[class_name] = {
                 "targets": n_gt,
                 "preds": n_preds,
-                "precision": prec_at_50,
-                "recall": rec_at_50,
-                "f1": (2 * prec_at_50 * rec_at_50 / (prec_at_50 + rec_at_50 + 1e-8)),
+                "tp": 0,
+                "fp": 0,
+                "fn": n_gt,
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
                 "ap50": ap50,
                 "ap75": ap75,
                 "ap50_95": ap50_95,
             }
 
-        # Overall summary
-        mAP50 = float(np.mean([res["ap50"] for res in results_per_class.values()]))
-        mAP75 = float(np.mean([res["ap75"] for res in results_per_class.values()]))
-        mAP50_95 = float(np.mean([res["ap50_95"] for res in results_per_class.values()]))
-        mean_p = float(np.mean([res["precision"] for res in results_per_class.values()]))
-        mean_r = float(np.mean([res["recall"] for res in results_per_class.values()]))
+        # Determine confidence threshold for classifying positive predictions (TP, FP, FN)
+        active_names = [cname for cname, res in results_per_class.items() if res["targets"] > 0]
+        if score_threshold is not None:
+            best_conf_threshold = float(score_threshold)
+        elif conf_threshold >= 0.05:
+            best_conf_threshold = float(conf_threshold)
+        elif active_names:
+            conf_grid = np.linspace(0.01, 0.99, 99)
+            best_f1 = -1.0
+            best_conf_threshold = 0.25
+            for tau in conf_grid:
+                p_list, r_list = [], []
+                for cname in active_names:
+                    scores_s, c_tp, c_fp, n_gt = class_pr_data_50[cname]
+                    # Count predictions with score >= tau (scores_s is descending)
+                    k = int(np.searchsorted(-scores_s, -tau, side="right"))
+                    tp_c = float(c_tp[k - 1]) if k > 0 else 0.0
+                    fp_c = float(c_fp[k - 1]) if k > 0 else 0.0
+                    fn_c = float(n_gt) - tp_c
+                    # Eq. (18): Precision = TP / (TP + FP)
+                    p_c = tp_c / (tp_c + fp_c) if (tp_c + fp_c) > 0 else 0.0
+                    # Eq. (19): Recall = TP / (TP + FN)
+                    r_c = tp_c / (tp_c + fn_c) if (tp_c + fn_c) > 0 else 0.0
+                    p_list.append(p_c)
+                    r_list.append(r_c)
+                mp = float(np.mean(p_list))
+                mr = float(np.mean(r_list))
+                f1 = 2.0 * mp * mr / (mp + mr + 1e-8)
+                if f1 > best_f1:
+                    best_f1 = f1
+                    best_conf_threshold = float(tau)
+        else:
+            best_conf_threshold = 0.25
+
+        # Compute exact TP, FP, FN, Precision (Eq. 18), and Recall (Eq. 19) for each class
+        total_tp = 0
+        total_fp = 0
+        total_fn = 0
+        for cname in self.class_names:
+            scores_s, c_tp, c_fp, n_gt = class_pr_data_50[cname]
+            k = int(np.searchsorted(-scores_s, -best_conf_threshold, side="right"))
+            tp_c = int(round(c_tp[k - 1])) if k > 0 else 0
+            fp_c = int(round(c_fp[k - 1])) if k > 0 else 0
+            fn_c = int(n_gt - tp_c)
+
+            # Eq. (18): Precision = TP / (TP + FP)
+            prec_val = float(tp_c / (tp_c + fp_c)) if (tp_c + fp_c) > 0 else 0.0
+            # Eq. (19): Recall = TP / (TP + FN)
+            rec_val = float(tp_c / (tp_c + fn_c)) if (tp_c + fn_c) > 0 else 0.0
+            f1_val = float(2.0 * prec_val * rec_val / (prec_val + rec_val + 1e-8))
+
+            results_per_class[cname]["tp"] = tp_c
+            results_per_class[cname]["fp"] = fp_c
+            results_per_class[cname]["fn"] = fn_c
+            results_per_class[cname]["precision"] = prec_val
+            results_per_class[cname]["recall"] = rec_val
+            results_per_class[cname]["f1"] = f1_val
+
+            total_tp += tp_c
+            total_fp += fp_c
+            total_fn += fn_c
+
+        # Eq. (20): mAP = (1 / N) * sum_{n=1}^{N} AP(n) over active classes
+        valid_classes = [res for res in results_per_class.values() if res["targets"] > 0]
+        if not valid_classes:
+            valid_classes = list(results_per_class.values())
+
+        mAP50 = float(np.mean([res["ap50"] for res in valid_classes]))
+        mAP75 = float(np.mean([res["ap75"] for res in valid_classes]))
+        mAP50_95 = float(np.mean([res["ap50_95"] for res in valid_classes]))
+        mean_p = float(np.mean([res["precision"] for res in valid_classes]))
+        mean_r = float(np.mean([res["recall"] for res in valid_classes]))
+        mean_f1 = float(2.0 * mean_p * mean_r / (mean_p + mean_r + 1e-8))
 
         return {
             "per_class": results_per_class,
+            "total_tp": total_tp,
+            "total_fp": total_fp,
+            "total_fn": total_fn,
             "mAP50": mAP50,
             "mAP75": mAP75,
             "mAP50_95": mAP50_95,
             "mean_precision": mean_p,
             "mean_recall": mean_r,
+            "mean_f1": mean_f1,
+            "best_conf_threshold": best_conf_threshold,
             "method": self.method,
         }
 
@@ -403,16 +491,18 @@ def print_academic_report(results, class_names):
     per_class = results["per_class"]
 
     total_targets = sum(v["targets"] for v in per_class.values())
-    total_preds = sum(v["preds"] for v in per_class.values())
+    total_tp = results.get("total_tp", sum(v.get("tp", 0) for v in per_class.values()))
+    total_fp = results.get("total_fp", sum(v.get("fp", 0) for v in per_class.values()))
+    total_fn = results.get("total_fn", sum(v.get("fn", 0) for v in per_class.values()))
 
     col_w = {
-        "class": max(15, max(len(c) for c in class_names) + 2),
-        "count": 9,
-        "metric": 10,
+        "class": max(13, max(len(c) for c in class_names) + 2),
+        "count": 7,
+        "metric": 9,
     }
 
-    border = "=" * 88
-    div = "-" * 88
+    border = "=" * 104
+    div = "-" * 104
 
     print("\n" + border)
     print(f"  ACADEMIC EVALUATION REPORT (Protocol: {results['method'].upper()})")
@@ -420,9 +510,11 @@ def print_academic_report(results, class_names):
     header = (
         f"{'Class':<{col_w['class']}} | "
         f"{'Targets':>{col_w['count']}} | "
-        f"{'Preds':>{col_w['count']}} | "
-        f"{'P@0.5':>{col_w['metric']}} | "
-        f"{'R@0.5':>{col_w['metric']}} | "
+        f"{'TP':>{col_w['count']}} | "
+        f"{'FP':>{col_w['count']}} | "
+        f"{'FN':>{col_w['count']}} | "
+        f"{'Precision':>{col_w['metric']}} | "
+        f"{'Recall':>{col_w['metric']}} | "
         f"{'mAP@0.50':>{col_w['metric']}} | "
         f"{'mAP@0.75':>{col_w['metric']}} | "
         f"{'mAP@50:95':>{col_w['metric']}}"
@@ -435,7 +527,9 @@ def print_academic_report(results, class_names):
         print(
             f"{cname:<{col_w['class']}} | "
             f"{stat.get('targets', 0):>{col_w['count']}} | "
-            f"{stat.get('preds', 0):>{col_w['count']}} | "
+            f"{stat.get('tp', 0):>{col_w['count']}} | "
+            f"{stat.get('fp', 0):>{col_w['count']}} | "
+            f"{stat.get('fn', 0):>{col_w['count']}} | "
             f"{stat.get('precision', 0.0):>{col_w['metric']}.4f} | "
             f"{stat.get('recall', 0.0):>{col_w['metric']}.4f} | "
             f"{stat.get('ap50', 0.0):>{col_w['metric']}.4f} | "
@@ -448,7 +542,9 @@ def print_academic_report(results, class_names):
     print(
         f"{'All (Mean)':<{col_w['class']}} | "
         f"{total_targets:>{col_w['count']}} | "
-        f"{total_preds:>{col_w['count']}} | "
+        f"{total_tp:>{col_w['count']}} | "
+        f"{total_fp:>{col_w['count']}} | "
+        f"{total_fn:>{col_w['count']}} | "
         f"{results['mean_precision']:>{col_w['metric']}.4f} | "
         f"{results['mean_recall']:>{col_w['metric']}.4f} | "
         f"{results['mAP50']:>{col_w['metric']}.4f} | "
@@ -457,66 +553,138 @@ def print_academic_report(results, class_names):
     )
     print(border)
 
-    # Clean IGMamba-style console summary
-    print(f"===> Metric: COCO Standard mAP (10 IoU steps: 0.50:0.05:0.95)")
-    print(f"===> mAP@0.50:       {results['mAP50']:.4f}  ({results['mAP50']*100:.2f}%)")
-    print(f"===> mAP@0.75:       {results['mAP75']:.4f}  ({results['mAP75']*100:.2f}%)")
-    print(f"===> mAP@0.50:0.95:  {results['mAP50_95']:.4f}  ({results['mAP50_95']*100:.2f}%)")
+    # Clean console summary matching LLEYOLO Equations (18)-(21)
+    mean_p = results.get("mean_precision", 0.0)
+    mean_r = results.get("mean_recall", 0.0)
+    print(f"===> Precision (TP/(TP+FP)): {mean_p:.4f}  ({mean_p*100:.2f}%)")
+    print(f"===> Recall    (TP/(TP+FN)): {mean_r:.4f}  ({mean_r*100:.2f}%)")
+    print(f"===> mAP@0.50:               {results['mAP50']:.4f}  ({results['mAP50']*100:.2f}%)")
+    print(f"===> mAP@0.75:               {results['mAP75']:.4f}  ({results['mAP75']*100:.2f}%)")
+    print(f"===> mAP@0.50:0.95:          {results['mAP50_95']:.4f}  ({results['mAP50_95']*100:.2f}%)")
     print(border + "\n")
 
 
 # ==================================================================================================
-# 6. Main Execution Pipeline
+# 6. Main Execution Pipeline (`metrics` / `run_evaluation`)
 # ==================================================================================================
 
-def run_evaluation(pred_dir, gt_dir, class_names, dataset_type="auto", method="coco", conf_thres=0.001):
-    """Loads all prediction & GT files, executes evaluation, and returns results dict."""
+_GT_MEMORY_CACHE = {}
+
+
+def _clean_stem(filepath: str) -> str:
+    stem = Path(filepath).stem
+    lower_stem = stem.lower()
+    for ext in (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"):
+        if lower_stem.endswith(ext):
+            return stem[: -len(ext)]
+    return stem
+
+
+def metrics(
+    pred_dir,
+    label_dir,
+    class_names=EXDARK_CLASSES,
+    dataset_type="auto",
+    method="coco",
+    conf_thres=0.001,
+):
+    """
+    Loads prediction `.txt` files from `pred_dir` and Ground Truth `.txt` files from `label_dir`,
+    computes COCO/VOC mAP (`mAP@0.50`, `mAP@0.75`, `mAP@0.50:0.95`), `Precision@0.50`, `Recall@0.50`,
+    and `F1-Score@0.50`, prints the academic report, and returns the results dictionary.
+    """
     evaluator = ObjectDetectionEvaluator(class_names=class_names, method=method)
 
-    # Collect ground truths
-    gt_files = glob.glob(os.path.join(gt_dir, "**", "*.txt"), recursive=True)
-    if not gt_files:
-        gt_files = glob.glob(os.path.join(gt_dir, "*.txt"))
-
-    print(f"Loading {len(gt_files)} Ground Truth files from: {gt_dir}")
-    for g_path in tqdm(gt_files, desc="Parsing GTs"):
-        stem = Path(g_path).stem
-        boxes = parse_ground_truth_file(g_path, dataset_type=dataset_type)
-        for c_label, box in boxes:
-            evaluator.add_ground_truth(stem, c_label, box)
-
-    # Collect predictions
+    # Collect predictions first
     pred_files = glob.glob(os.path.join(pred_dir, "**", "*.txt"), recursive=True)
     if not pred_files:
         pred_files = glob.glob(os.path.join(pred_dir, "*.txt"))
 
-    print(f"Loading {len(pred_files)} Prediction files from: {pred_dir}")
+    pred_stems = set()
     for p_path in tqdm(pred_files, desc="Parsing Preds"):
-        stem = Path(p_path).stem
+        stem = _clean_stem(p_path)
+        pred_stems.add(stem)
+        evaluator.image_ids.add(stem)
         preds = parse_prediction_file(p_path)
         for c_label, score, box in preds:
             evaluator.add_prediction(stem, c_label, score, box)
 
+    # Load & cache Ground Truths from label_dir (both in-memory and on-disk .gt_cache.json)
+    cache_key = (os.path.abspath(label_dir), str(dataset_type).lower())
+    if cache_key not in _GT_MEMORY_CACHE:
+        disk_cache_path = os.path.join(label_dir, f".gt_cache_{str(dataset_type).lower()}.json")
+        parsed_gts = None
+        if os.path.exists(disk_cache_path):
+            try:
+                with open(disk_cache_path, "r", encoding="utf-8") as cf:
+                    parsed_gts = json.load(cf)
+            except Exception:
+                parsed_gts = None
+
+        if parsed_gts is None:
+            gt_files = glob.glob(os.path.join(label_dir, "**", "*.txt"), recursive=True)
+            if not gt_files:
+                gt_files = glob.glob(os.path.join(label_dir, "*.txt"))
+
+            print(f"Loading {len(gt_files)} Ground Truth files from: {label_dir}")
+            parsed_gts = {}
+            for g_path in tqdm(gt_files, desc="Parsing GTs"):
+                stem = _clean_stem(g_path)
+                parsed_gts[stem] = parse_ground_truth_file(g_path, dataset_type=dataset_type)
+            try:
+                with open(disk_cache_path, "w", encoding="utf-8") as cf:
+                    json.dump(parsed_gts, cf)
+            except Exception:
+                pass
+        _GT_MEMORY_CACHE[cache_key] = parsed_gts
+    else:
+        parsed_gts = _GT_MEMORY_CACHE[cache_key]
+
+    # If label_dir contains a superset of splits (e.g. DarkFace label/ has all 6000 images while pred_dir has 900 val images),
+    # restrict evaluation to the evaluated split stems when pred_stems is a subset of parsed_gts.
+    use_subset = (
+        len(pred_stems) > 0
+        and len(parsed_gts) > len(pred_stems)
+        and pred_stems.issubset(parsed_gts.keys())
+    )
+    target_gt_stems = pred_stems if use_subset else parsed_gts.keys()
+
+    for stem in target_gt_stems:
+        evaluator.image_ids.add(stem)
+        for c_label, box in parsed_gts.get(stem, []):
+            c_idx = int(c_label) if str(c_label).isdigit() else c_label
+            evaluator.add_ground_truth(stem, c_idx, box)
+
     # Run evaluation
-    print(f"\nCalculating academic metrics with protocol [{method.upper()}]...")
     results = evaluator.evaluate(conf_threshold=conf_thres)
     print_academic_report(results, class_names)
     return results
 
 
+# Backward-compatible alias
+run_evaluation = metrics
+
+
 if __name__ == "__main__":
     mea_parser = argparse.ArgumentParser(
-        description="Object Detection Academic Evaluation Suite (mAP50, mAP75, mAP50:95)",
+        description="Object Detection Academic Evaluation Suite (mAP50, mAP75, mAP50:95, Precision, Recall)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # Dataset presets (matching IGMamba measure.py style: --lol, --lol_v2_real, etc.)
+    # Dataset presets (matching IGMamba measure.py style)
     mea_parser.add_argument("--exdark", action="store_true", help="Evaluate ExDark dataset (12 classes)")
     mea_parser.add_argument("--darkface", action="store_true", help="Evaluate DarkFace dataset (Face)")
     mea_parser.add_argument("--voc", action="store_true", help="Evaluate Pascal VOC dataset (20 classes)")
+    mea_parser.add_argument(
+        "--split",
+        type=str,
+        choices=["val", "test", "train"],
+        default="test",
+        help="Dataset split to measure (default: test)",
+    )
 
     # Custom paths
-    mea_parser.add_argument("--pred_dir", type=str, default="./output/predictions", help="Directory of prediction .txt files")
+    mea_parser.add_argument("--pred_dir", type=str, default="", help="Directory of prediction .txt files")
     mea_parser.add_argument("--gt_dir", type=str, default="", help="Directory of ground truth .txt files")
     mea_parser.add_argument("--conf_thres", type=float, default=0.001, help="Confidence threshold for predictions")
     mea_parser.add_argument("--method", type=str, choices=["coco", "voc"], default="coco",
@@ -531,20 +699,36 @@ if __name__ == "__main__":
         classes = EXDARK_CLASSES
         dataset_type = "exdark"
         if not args.gt_dir:
-            args.gt_dir = "./dataset/ExDark/labels_raw/val"
+            args.gt_dir = f"./dataset/ExDark/labels_raw/{args.split}"
+        if not args.pred_dir:
+            cand_dirs = [
+                f"./results/eval/exdark_{args.split}/preds",
+                f"./results/exdark_{args.split}_preds",
+                "./results/exdark_preds" if args.split == "val" else "./results/exdark_test_preds",
+                f"./output/ExDark/{args.split}",
+            ]
+            args.pred_dir = next((d for d in cand_dirs if os.path.exists(d)), cand_dirs[0])
     elif args.darkface:
         classes = DARKFACE_CLASSES
         dataset_type = "darkface"
         if not args.gt_dir:
             args.gt_dir = "./dataset/DarkFace/label"
+        if not args.pred_dir:
+            args.pred_dir = f"./results/eval/darkface_{args.split}/preds"
     elif args.voc:
         classes = VOC_CLASSES
         dataset_type = "voc"
-    else:
-        # Default fallback to ExDark if no dataset flag specified
-        classes = EXDARK_CLASSES
         if not args.gt_dir:
-            args.gt_dir = "./dataset/ExDark/labels_raw/val"
+            args.gt_dir = f"./dataset/VOC/labels/{args.split}"
+        if not args.pred_dir:
+            args.pred_dir = f"./results/eval/voc_{args.split}/preds"
+    else:
+        classes = EXDARK_CLASSES
+        dataset_type = "exdark"
+        if not args.gt_dir:
+            args.gt_dir = f"./dataset/ExDark/labels_raw/{args.split}"
+        if not args.pred_dir:
+            args.pred_dir = f"./results/eval/exdark_{args.split}/preds"
 
     if not os.path.exists(args.gt_dir):
         print(f"Warning: Ground truth directory not found at: '{args.gt_dir}'.")
@@ -552,12 +736,12 @@ if __name__ == "__main__":
 
     if not os.path.exists(args.pred_dir):
         print(f"Notice: Prediction directory '{args.pred_dir}' does not exist yet.")
-        print("Run your detection model inference to generate predictions, then re-run measure.py.")
+        print("Run `python eval.py --weights <ckpt>` first to generate predictions, then run `python measure.py`.")
         sys.exit(0)
 
-    results = run_evaluation(
+    results = metrics(
         pred_dir=args.pred_dir,
-        gt_dir=args.gt_dir,
+        label_dir=args.gt_dir,
         class_names=classes,
         dataset_type=dataset_type,
         method=args.method,
@@ -565,6 +749,7 @@ if __name__ == "__main__":
     )
 
     if args.save_json:
+        os.makedirs(os.path.dirname(os.path.abspath(args.save_json)), exist_ok=True)
         with open(args.save_json, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=4)
         print(f"Results saved to: {args.save_json}")
