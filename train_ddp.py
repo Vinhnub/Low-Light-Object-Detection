@@ -35,21 +35,19 @@ from data.util import DARKFACE_CLASSES, EXDARK_CLASSES, xywhn2xyxy
 from eval import eval
 from loss.losses import *
 from measure import VOC_CLASSES, metrics
-from net.Yolov5 import (
-    DetectionModel,
+from net import (
     ModelEMA,
-    YOLOv5,
-    load_yolov5_checkpoint,
+    build_yolo_model,
+    get_model_family,
+    load_yolo_checkpoint,
     non_max_suppression,
     smart_optimizer,
-    yolov5l,
-    yolov5m,
-    yolov5n,
-    yolov5s,
-    yolov5x,
 )
 
 opt = option().parse_args()
+if opt.box_weight is None:
+    _family = get_model_family(opt.cfg if opt.cfg else opt.model)
+    opt.box_weight = 7.5 if _family in {"yolov11", "yolov26"} else 0.05
 
 
 def is_master() -> bool:
@@ -177,7 +175,12 @@ def save_training_visual_sample(img_tensor, targets_tensor, class_names, save_di
     raw_model.eval()
     with torch.no_grad():
         pred_out, _ = raw_model(img_tensor[0:1])
-        dets = non_max_suppression(pred_out, conf_thres=0.25, iou_thres=0.45)[0]
+        dets = non_max_suppression(
+            pred_out,
+            conf_thres=0.25,
+            iou_thres=0.45,
+            end2end=getattr(raw_model, "end2end", False),
+        )[0]
         for *xyxy, conf, cls_id in dets.cpu().numpy():
             x1, y1, x2, y2 = xyxy
             cid = int(cls_id)
@@ -287,12 +290,13 @@ def train(epoch: int, local_rank: int):
         pic_cnt += 1
         pic_last_10 += 1
 
+        aux_label = getattr(criterion, "loss_names", ("box", "obj", "cls"))[1].capitalize()
         if is_master() and hasattr(data_iterator, "set_postfix"):
             data_iterator.set_postfix(
                 {
                     "Total": f"{loss_print / pic_cnt:.4f}",
                     "Box": f"{lbox_sum / pic_cnt:.4f}",
-                    "Obj": f"{lobj_sum / pic_cnt:.4f}",
+                    aux_label: f"{lobj_sum / pic_cnt:.4f}",
                     "Cls": f"{lcls_sum / pic_cnt:.4f}",
                     "lr": f"{optimizer.param_groups[0]['lr']:.6f}",
                 }
@@ -300,10 +304,11 @@ def train(epoch: int, local_rank: int):
 
         if iter_cnt == train_len and is_master():
             print(
-                "===> Epoch[{}]: Total Loss: {:.4f} || Box: {:.4f} | Obj: {:.4f} | Cls: {:.4f} || lr={:.8f}.".format(
+                "===> Epoch[{}]: Total Loss: {:.4f} || Box: {:.4f} | {}: {:.4f} | Cls: {:.4f} || lr={:.8f}.".format(
                     epoch,
                     loss_last_10 / max(1, pic_last_10),
                     lbox_sum / max(1, pic_cnt),
+                    aux_label,
                     lobj_sum / max(1, pic_cnt),
                     lcls_sum / max(1, pic_cnt),
                     optimizer.param_groups[0]["lr"],
@@ -485,18 +490,15 @@ def build_model(local_rank: int, num_classes: int):
         print(
             f"===> Building model: {opt.model} (num_classes={num_classes}, modular={opt.modular})"
         )
-    model_builders = {
-        "yolov5n": yolov5n,
-        "yolov5s": yolov5s,
-        "yolov5m": yolov5m,
-        "yolov5l": yolov5l,
-        "yolov5x": yolov5x,
-    }
-    if opt.cfg and os.path.exists(opt.cfg):
-        net = DetectionModel(cfg=opt.cfg, ch=3, nc=num_classes)
-    else:
-        builder = model_builders.get(opt.model.lower(), yolov5s)
-        net = builder(num_classes=num_classes, in_channels=3, modular=opt.modular)
+    cfg_path = opt.cfg if (opt.cfg and os.path.exists(opt.cfg)) else None
+    net = build_yolo_model(
+        model_name=opt.model,
+        num_classes=num_classes,
+        in_channels=3,
+        cfg=cfg_path,
+        modular=opt.modular,
+        end2end=opt.end2end,
+    )
 
     if opt.gpu_mode:
         net = net.cuda(local_rank)
@@ -523,7 +525,7 @@ def build_model(local_rank: int, num_classes: int):
         # Ensure rank 0 downloads first if auto-downloading
         if dist.is_initialized() and not is_master():
             dist.barrier()
-        loaded_ckpt = load_yolov5_checkpoint(
+        loaded_ckpt = load_yolo_checkpoint(
             net, ckpt_path, model_name=opt.model, verbose=is_master()
         )
         if dist.is_initialized() and is_master():
@@ -698,29 +700,34 @@ if __name__ == "__main__":
     last_model_path = None
 
     start_epoch = opt.start_epoch if opt.start_epoch > 0 else 0
+    if start_epoch > 0 and hasattr(criterion, "sync_updates"):
+        criterion.sync_updates(start_epoch)
+
     now = datetime.now().strftime("%Y-%m-%d-%H%M%S")
     metrics_md_path = f"./results/training/metrics{now}.md"
+    aux_header = getattr(criterion, "loss_names", ("box", "obj", "cls"))[1].capitalize()
 
     if is_master():
         os.makedirs(opt.val_folder, exist_ok=True)
         os.makedirs("./results/training", exist_ok=True)
         os.makedirs(opt.save_folder, exist_ok=True)
 
+        init_lr = resume_lr if resume_lr is not None else opt.lr
         with open(metrics_md_path, "w", encoding="utf-8") as f:
             f.write(f"dataset: {opt.dataset}\n")
             f.write(f"model: {opt.model} (modular={opt.modular}, world_size={get_world_size()})\n")
             f.write(f"num_classes: {len(class_names)}\n")
             f.write(f"optimizer: {opt.optimizer}\n")
-            f.write(f"lr: {optimizer.param_groups[0]['lr']}\n")
+            f.write(f"lr: {init_lr}\n")
             f.write(f"batch size (per GPU): {opt.batchSize}\n")
             f.write(f"img size: {opt.imgSize}\n")
             f.write(f"iou_type: {opt.iou_type}\n")
             f.write(f"box_weight: {opt.box_weight}\n")
-            f.write(f"obj_weight: {opt.obj_weight}\n")
+            f.write(f"obj_weight: {opt.obj_weight} | dfl_weight: {opt.dfl_weight}\n")
             f.write(f"cls_weight: {opt.cls_weight}\n")
             f.write(f"mosaic: {opt.mosaic} | gamma: {opt.gamma}\n\n")
             f.write(
-                "| Epochs | Total Loss | Box | Obj | Cls | Precision | Recall | mAP@0.50 | mAP@0.75 | mAP@50:95 | lr | Note |\n"
+                f"| Epochs | Total Loss | Box | {aux_header} | Cls | Precision | Recall | mAP@0.50 | mAP@0.75 | mAP@50:95 | lr | Note |\n"
             )
             f.write("|---|---|---|---|---|---|---|---|---|---|---|---|\n")
 
@@ -746,6 +753,8 @@ if __name__ == "__main__":
         current_lr = optimizer.param_groups[0]["lr"]
         epoch_loss, pic_num, detailed_losses = train(epoch, local_rank)
         scheduler.step()
+        if hasattr(criterion, "update"):
+            criterion.update()
 
         if epoch % opt.snapshots == 0 or epoch == opt.nEpochs:
             model_out_path = checkpoint(epoch, lr=current_lr)

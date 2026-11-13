@@ -425,16 +425,42 @@ def non_max_suppression(
     labels: Tuple = (),
     max_det: int = 300,
     nm: int = 0,  # number of masks
+    end2end: bool = False,
 ) -> List[torch.Tensor]:
     """
     Non-Maximum Suppression (NMS) on inference results to reject overlapping detections.
+    Supports YOLOv5 `(B, N, 5+nc+nm)`, YOLOv8/YOLOv11 `(B, 4+nc+nm, N)`,
+    and YOLOv26 end-to-end `(B, K, 6+nm)`.
 
     Returns:
          list of detections, on (n,6) tensor per image [xyxy, conf, cls]
     """
     if isinstance(prediction, (list, tuple)):
-        # YOLOv5 model in validation mode: output = (inference_out, loss_out)
+        # Model in validation mode: output = (inference_out, loss_out)
         prediction = prediction[0]
+
+    # Delegate End-to-End (YOLOv26) or Anchor-Free (YOLOv11) formats cleanly
+    is_e2e = end2end or (
+        prediction.ndim == 3 and prediction.shape[-1] == 6 + nm and prediction.shape[1] <= 1000
+    )
+    is_anchor_free = (
+        not is_e2e and prediction.ndim == 3 and prediction.shape[1] < prediction.shape[2]
+    )
+    if is_e2e or is_anchor_free:
+        from net.Yolov11.utils import non_max_suppression as unified_nms
+
+        return unified_nms(
+            prediction,
+            conf_thres=conf_thres,
+            iou_thres=iou_thres,
+            classes=classes,
+            agnostic=agnostic,
+            multi_label=multi_label,
+            labels=labels,
+            max_det=max_det,
+            nm=nm,
+            end2end=end2end,
+        )
 
     bs = prediction.shape[0]  # batch size
     nc = prediction.shape[2] - nm - 5  # number of classes

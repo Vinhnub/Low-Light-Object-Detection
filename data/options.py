@@ -1,5 +1,7 @@
 import argparse
 
+from net import SUPPORTED_MODELS
+
 
 def _str2bool(v):
     if isinstance(v, bool):
@@ -13,34 +15,42 @@ def _str2bool(v):
 
 
 def option():
-    # Training settings for Low-Light Object Detection (YOLOv5)
-    parser = argparse.ArgumentParser(description="Low-Light Object Detection (YOLOv5)")
+    # Training settings for Low-Light Object Detection (YOLOv5 / YOLOv11 / YOLOv26)
+    parser = argparse.ArgumentParser(
+        description="Low-Light Object Detection (YOLOv5 / YOLOv11 / YOLOv26)"
+    )
 
     # 1. Model & Training parameters
     parser.add_argument(
         "--model",
         type=str,
         default="yolov5s",
-        choices=["yolov5n", "yolov5s", "yolov5m", "yolov5l", "yolov5x"],
-        help="YOLOv5 model variant (default: %(default)s)",
+        choices=list(SUPPORTED_MODELS),
+        help="YOLO model variant: yolov5*/yolov11*/yolo11*/yolov26*/yolo26* (default: %(default)s)",
     )
     parser.add_argument(
         "--cfg",
         type=str,
         default="",
-        help="Optional path to custom model YAML file (e.g. net/Yolov5/configs/yolov5s.yaml)",
+        help="Optional path to custom model YAML file (e.g. net/Yolov11/configs/yolov11s.yaml)",
     )
     parser.add_argument(
         "--modular",
         type=_str2bool,
         default=False,
-        help="Use explicit modular YOLOv5Backbone + YOLOv5Neck + Detect architecture",
+        help="Use explicit modular Backbone + Neck + Detect architecture",
+    )
+    parser.add_argument(
+        "--end2end",
+        type=_str2bool,
+        default=None,
+        help="Override end2end NMS-free inference mode (default: auto from model family)",
     )
     parser.add_argument(
         "--pretrained",
         type=str,
         default="auto",
-        help="Path to COCO pretrained weights (.pt / .pth), 'auto' to load/download official yolov5*.pt, or 'none' to train from scratch",
+        help="Path to COCO pretrained weights (.pt / .pth), 'auto' to download official weights, or 'none' to train from scratch",
     )
     parser.add_argument(
         "--resume",
@@ -144,12 +154,12 @@ def option():
     # 2. Scheduler & Warmup settings
     parser.add_argument("--cos_restart_cyclic", type=_str2bool, default=False)
     parser.add_argument("--cos_restart", type=_str2bool, default=True)
-    parser.add_argument("--warmup_epochs", type=int, default=3, help="warmup_epochs")
+    parser.add_argument("--warmup_epochs", type=int, default=0, help="warmup_epochs")
     parser.add_argument(
         "--start_warmup",
         type=_str2bool,
-        default=True,
-        help="turn False to train without warmup",
+        default=False,
+        help="turn True to train with warmup",
     )
 
     # 3. Dataset paths & Selection
@@ -274,18 +284,24 @@ def option():
         help="Location to save model checkpoints",
     )
 
-    # 4. YOLOv5 Detection Loss weights & Hyperparameters
+    # 4. Detection Loss weights & Hyperparameters
     parser.add_argument(
         "--box_weight",
         type=float,
-        default=0.05,
-        help="Bounding box regression loss gain (default: 0.05)",
+        default=None,
+        help="Bounding box regression loss gain (default: auto -> 0.05 for YOLOv5, 7.5 for YOLOv11/YOLOv26)",
     )
     parser.add_argument(
         "--obj_weight",
         type=float,
         default=1.0,
-        help="Objectness confidence loss gain (default: 1.0)",
+        help="Objectness confidence loss gain for YOLOv5 (default: 1.0)",
+    )
+    parser.add_argument(
+        "--dfl_weight",
+        type=float,
+        default=1.5,
+        help="DFL / L1 box loss gain for YOLOv11/YOLOv26 (default: 1.5)",
     )
     parser.add_argument(
         "--cls_weight",
