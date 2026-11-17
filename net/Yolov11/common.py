@@ -871,7 +871,7 @@ class EdgeCAB(nn.Module):
         self.num_heads = num_heads
         self.head_dim = inner_dim // num_heads
         self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
-        self.gamma = nn.Parameter(torch.full((1, dim, 1, 1), 0.01))
+        self.gamma = nn.Parameter(torch.full((1, dim, 1, 1), 0.0))
         self.edge_scale = nn.Parameter(torch.tensor(1.0))
 
         self.q = nn.Conv2d(dim, inner_dim, kernel_size=1, bias=bias)
