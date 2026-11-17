@@ -40,12 +40,15 @@ from .common import (
     C3k,
     C3k2,
     C3x,
+    CAB,
     Concat,
     Conv,
     Conv2,
     ConvTranspose,
     DWConv,
     DWConvTranspose2d,
+    EdgeCAB,
+    EdgeExtractor,
     Focus,
     GhostBottleneck,
     GhostConv,
@@ -119,7 +122,10 @@ def get_yolov11_cfg_dict(
             [-1, 1, "Conv", [512, 3, 2]],                  # 20
             [[-1, 10], 1, "Concat", [1]],                  # 21 cat head P5
             [-1, 2, "C3k2", [1024, True]],                 # 22 (P5/32-large)
-            [[16, 19, 22], 1, "Detect", ["nc"]],           # 23 Detect(P3, P4, P5)
+            [16, 1, "EdgeCAB", [4, False, 2]],             # 23 (P3/8-small EdgeCAB self-attn)
+            [19, 1, "EdgeCAB", [4, False, 2]],             # 24 (P4/16-medium EdgeCAB self-attn)
+            [22, 1, "EdgeCAB", [4, False, 2]],             # 25 (P5/32-large EdgeCAB self-attn)
+            [[23, 24, 25], 1, "Detect", ["nc"]],           # 26 Detect(P3, P4, P5)
         ],
     }
 
@@ -636,6 +642,8 @@ def parse_model(
         "C2PSA": C2PSA,
         "SCDown": SCDown,
         "CBAM": CBAM,
+        "CAB": CAB,
+        "EdgeCAB": EdgeCAB,
         "Concat": Concat,
         "Proto": Proto,
         "Detect": Detect,
@@ -675,6 +683,10 @@ def parse_model(
             args = [ch_list[f]]
         elif m is Concat:
             c2 = sum(ch_list[x] for x in f)
+        elif m in {CAB, EdgeCAB}:
+            c1 = ch_list[f] if isinstance(f, int) else ch_list[f[0]]
+            c2 = c1
+            args = [c1, *args]
         elif m in {Detect, Segment, Pose, OBB}:
             args.extend([reg_max, bool(end2end), [ch_list[x] for x in f]])
             if m is Segment:
@@ -715,6 +727,11 @@ class BaseModel(nn.Module):
     def _forward_once(
         self, x: torch.Tensor, profile: bool = False, visualize: bool = False
     ):
+        edge_map = (
+            self.edge_extractor(x)
+            if hasattr(self, "edge_extractor") and self.edge_extractor is not None
+            else None
+        )
         y = []
         for m in self.model:
             if m.f != -1:
@@ -723,7 +740,10 @@ class BaseModel(nn.Module):
                     if isinstance(m.f, int)
                     else [x if j == -1 else y[j] for j in m.f]
                 )
-            x = m(x)
+            if isinstance(m, (CAB, EdgeCAB)):
+                x = m(x, edge_map=edge_map)
+            else:
+                x = m(x)
             y.append(x if m.i in self.save else None)
         return x
 
@@ -817,6 +837,7 @@ class DetectionModel(BaseModel):
             self.yaml["nc"] = nc
 
         self.model, self.save = parse_model(copy.deepcopy(self.yaml), ch=ch)
+        self.edge_extractor = EdgeExtractor(in_channels=ch, rgb_to_gray=(ch == 3))
         self.names = [str(i) for i in range(self.yaml["nc"])]
         self.inplace = self.yaml.get("inplace", True)
 
@@ -1056,6 +1077,7 @@ class YOLOv11Neck(nn.Module):
         width_multiple: float = 0.50,
         max_channels: int = 1024,
         c3k_override: bool = False,
+        num_heads: int = 4,
     ):
         super().__init__()
         c3, c4, c5 = in_channels
@@ -1082,8 +1104,15 @@ class YOLOv11Neck(nn.Module):
         self.down_p4 = Conv(c4_out, c4_out, k=3, s=2)  # Layer 20
         self.c3k2_n5 = C3k2(c4_out + c5, c5_out, n=d(2), c3k=True)  # Layer 22 (N5/32)
 
+        # Pre-Head Edge-Guided Transposed Self-Attention refinement
+        self.attn_p3 = EdgeCAB(c3_out, num_heads=num_heads, bias=False, reduction=2)  # Layer 23
+        self.attn_p4 = EdgeCAB(c4_out, num_heads=num_heads, bias=False, reduction=2)  # Layer 24
+        self.attn_p5 = EdgeCAB(c5_out, num_heads=num_heads, bias=False, reduction=2)  # Layer 25
+
     def forward(
-        self, features: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        self,
+        features: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        edge_map: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         p3, p4, p5 = features
 
@@ -1094,6 +1123,11 @@ class YOLOv11Neck(nn.Module):
         # Bottom-up PAN
         n4 = self.c3k2_n4(torch.cat([self.down_p3(n3), f_p4], dim=1))
         n5 = self.c3k2_n5(torch.cat([self.down_p4(n4), p5], dim=1))
+
+        # Pre-Head EdgeCAB Self-Attention
+        n3 = self.attn_p3(n3, edge_map=edge_map)
+        n4 = self.attn_p4(n4, edge_map=edge_map)
+        n5 = self.attn_p5(n5, edge_map=edge_map)
 
         return [n3, n4, n5]
 
@@ -1128,6 +1162,7 @@ class YOLOv11(nn.Module):
         self.names = [str(i) for i in range(num_classes)]
         self.inplace = inplace
 
+        self.edge_extractor = EdgeExtractor(in_channels=in_channels, rgb_to_gray=(in_channels == 3))
         self.backbone = YOLOv11Backbone(
             in_channels=in_channels,
             depth_multiple=depth_multiple,
@@ -1174,13 +1209,15 @@ class YOLOv11(nn.Module):
     def extract_features(
         self, x: torch.Tensor
     ) -> Tuple[Tuple[torch.Tensor, ...], List[torch.Tensor]]:
+        edge_map = self.edge_extractor(x)
         backbone_feats = self.backbone(x)
-        neck_feats = self.neck(backbone_feats)
+        neck_feats = self.neck(backbone_feats, edge_map=edge_map)
         return backbone_feats, neck_feats
 
     def forward(self, x: torch.Tensor):
+        edge_map = self.edge_extractor(x)
         p3, p4, p5 = self.backbone(x)
-        neck_feats = self.neck((p3, p4, p5))
+        neck_feats = self.neck((p3, p4, p5), edge_map=edge_map)
         return self.head(neck_feats)
 
     def fuse(self):

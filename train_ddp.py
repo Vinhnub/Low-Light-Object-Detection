@@ -539,14 +539,46 @@ def build_model(local_rank: int, num_classes: int):
         #     net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(net).to(local_rank)
         if is_master():
             print(f"===> Sử dụng DistributedDataParallel (DDP) trên {get_world_size()} GPUs!")
-        net = DDP(
-            net,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            find_unused_parameters=False,
-        )
+        net = wrap_ddp(net, local_rank)
 
     return net, checkpoint_data
+
+
+def wrap_ddp(net: torch.nn.Module, local_rank: int) -> torch.nn.Module:
+    """Wrap a model with DistributedDataParallel when distributed training is initialized."""
+    if not dist.is_initialized():
+        return net
+    ddp_kwargs = {"device_ids": [local_rank], "output_device": local_rank} if opt.gpu_mode else {}
+    return DDP(net, find_unused_parameters=False, **ddp_kwargs)
+
+
+def set_backbone_trainable(net: torch.nn.Module, trainable: bool) -> None:
+    """Freeze or unfreeze backbone parameters for staged fine-tuning."""
+    raw_net = get_model_module(net)
+    if hasattr(raw_net, "backbone"):
+        target = raw_net.backbone
+    elif hasattr(raw_net, "model") and isinstance(raw_net.model, torch.nn.Sequential):
+        n_backbone = (
+            len(raw_net.yaml["backbone"])
+            if hasattr(raw_net, "yaml") and isinstance(raw_net.yaml, dict) and "backbone" in raw_net.yaml
+            else 10
+        )
+        target = raw_net.model[:n_backbone]
+    else:
+        return
+    for p in target.parameters():
+        p.requires_grad = trainable
+
+
+def sync_backbone_freeze_state(trainable: bool, local_rank: int) -> None:
+    """Toggle backbone trainability and refresh DDP buckets safely across ranks."""
+    global model
+    raw_net = get_model_module(model)
+    set_backbone_trainable(raw_net, trainable)
+    if dist.is_initialized():
+        model = None
+        dist.barrier()
+        model = wrap_ddp(raw_net, local_rank)
 
 
 def make_scheduler(lr=None):
@@ -749,7 +781,23 @@ if __name__ == "__main__":
         val_label_dir = opt.data_valgt_custom
         test_label_dir = opt.data_valgt_custom
 
+    backbone_frozen = False
+    if opt.freeze_epochs > 0 and start_epoch < opt.freeze_epochs:
+        sync_backbone_freeze_state(False, local_rank)
+        backbone_frozen = True
+        if is_master():
+            print(
+                f"===> [Staged Fine-Tuning] Đóng băng Backbone trong {opt.freeze_epochs} epochs đầu (đến epoch {opt.freeze_epochs})."
+            )
+
     for epoch in range(start_epoch + 1, opt.nEpochs + 1):
+        if backbone_frozen and epoch > opt.freeze_epochs:
+            sync_backbone_freeze_state(True, local_rank)
+            backbone_frozen = False
+            if is_master():
+                print(
+                    f"===> [Epoch {epoch}] Mở khóa toàn bộ Backbone để fine-tune end-to-end."
+                )
         current_lr = optimizer.param_groups[0]["lr"]
         epoch_loss, pic_num, detailed_losses = train(epoch, local_rank)
         scheduler.step()

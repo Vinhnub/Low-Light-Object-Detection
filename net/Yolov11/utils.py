@@ -98,6 +98,12 @@ def smart_optimizer(
         elif hasattr(v, "weight") and isinstance(v.weight, nn.Parameter):
             g[1].append(v.weight)
 
+    # Catch standalone nn.Parameter attributes (e.g., EdgeCAB.temperature, gamma, edge_scale, EdgeExtractor.scale/offset)
+    included = {id(p) for group in g for p in group}
+    for p in de_parallel(model).parameters():
+        if id(p) not in included:
+            g[2].append(p)
+
     opt_name = name.upper()
     if opt_name == "ADAM":
         optimizer = torch.optim.Adam(g[2], lr=lr, betas=(momentum, 0.999))
@@ -168,7 +174,10 @@ def _register_ultralytics_unpickle_aliases() -> None:
         "C3k",
         "C3k2",
         "C3x",
+        "CAB",
         "DFL",
+        "EdgeCAB",
+        "EdgeExtractor",
         "GhostBottleneck",
         "PSA",
         "PSABlock",
@@ -279,8 +288,8 @@ def load_yolov11_checkpoint(
                 else m_obj
             )
 
-    # Bidirectional mapping between sequential `model.0..23.*` and modular `backbone/neck/head.*`
-    seq_to_mod_prefix = {
+    # Bidirectional mapping across 24-layer official, 27-layer EdgeCAB, and modular YOLOv11 models
+    base_seq_to_mod = {
         "model.0.": "backbone.stem.",
         "model.1.": "backbone.stage1.0.",
         "model.2.": "backbone.stage1.1.",
@@ -298,33 +307,50 @@ def load_yolov11_checkpoint(
         "model.19.": "neck.c3k2_n4.",
         "model.20.": "neck.down_p4.",
         "model.22.": "neck.c3k2_n5.",
-        "model.23.": "head.",
     }
-    mod_to_seq_prefix = {v: k for k, v in seq_to_mod_prefix.items()}
+    seq24_to_mod = {**base_seq_to_mod, "model.23.": "head."}
+    seq27_to_mod = {
+        **base_seq_to_mod,
+        "model.23.": "neck.attn_p3.",
+        "model.24.": "neck.attn_p4.",
+        "model.25.": "neck.attn_p5.",
+        "model.26.": "head.",
+    }
+    seq24_to_seq27 = {"model.23.": "model.26."}
+    mod_to_seq27 = {v: k for k, v in seq27_to_mod.items()}
+
+    clean_keys = [k[7:] if k.startswith("module.") else k for k in raw_state_dict.keys()]
+    src_is_27 = any(k.startswith("model.26.") for k in clean_keys)
+    src_is_mod = any(k.startswith("backbone.") for k in clean_keys)
+    src_is_24 = any(k.startswith("model.23.cv") or k.startswith("model.23.dfl") for k in clean_keys) and not src_is_27
 
     target_model = de_parallel(model)
     model_dict = target_model.state_dict()
+    dst_is_27 = any(k.startswith("model.26.") for k in model_dict)
+    dst_is_mod = any(k.startswith("backbone.") for k in model_dict)
+
+    prefix_map: Dict[str, str] = {}
+    if dst_is_mod and src_is_24:
+        prefix_map = seq24_to_mod
+    elif dst_is_mod and src_is_27:
+        prefix_map = seq27_to_mod
+    elif dst_is_27 and src_is_24:
+        prefix_map = seq24_to_seq27
+    elif dst_is_27 and src_is_mod:
+        prefix_map = mod_to_seq27
+
     filtered_state_dict = {}
     for k, v in raw_state_dict.items():
         name = k[7:] if k.startswith("module.") else k
         if isinstance(v, torch.Tensor) and v.is_floating_point():
             v = v.float()
-        if name not in model_dict:
-            mapped = False
-            for seq_p, mod_p in seq_to_mod_prefix.items():
-                if name.startswith(seq_p):
-                    cand = mod_p + name[len(seq_p) :]
+        if name not in model_dict and prefix_map:
+            for src_p, dst_p in prefix_map.items():
+                if name.startswith(src_p):
+                    cand = dst_p + name[len(src_p) :]
                     if cand in model_dict:
                         name = cand
-                        mapped = True
                         break
-            if not mapped:
-                for mod_p, seq_p in mod_to_seq_prefix.items():
-                    if name.startswith(mod_p):
-                        cand = seq_p + name[len(mod_p) :]
-                        if cand in model_dict:
-                            name = cand
-                            break
         if name in model_dict and model_dict[name].shape == v.shape:
             filtered_state_dict[name] = v
 
