@@ -734,14 +734,23 @@ class YOLOv11DetectionLoss(nn.Module):
         if nl == 0:
             return torch.zeros(batch_size, 0, 5, device=self.device)
 
-        i = targets_t[:, 0]
-        _, counts = i.unique(return_counts=True)
-        counts = counts.to(dtype=torch.int32)
-        out = torch.zeros(batch_size, int(counts.max().item()), 5, device=self.device)
-        for j in range(batch_size):
-            matches = i == j
-            if n := int(matches.sum().item()):
-                out[j, :n] = targets_t[matches, 1:]
+        b_idx = targets_t[:, 0].long()
+        counts = torch.bincount(b_idx, minlength=batch_size)
+        max_n = int(counts.max().item())
+        if max_n == 0:
+            return torch.zeros(batch_size, 0, 5, device=self.device)
+
+        order = torch.argsort(b_idx, stable=True)
+        b_sorted = b_idx[order]
+        t_sorted = targets_t[order, 1:]
+
+        offsets = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        if batch_size > 1:
+            offsets[1:] = counts[:-1].cumsum(0)
+        slot = torch.arange(nl, device=self.device) - offsets[b_sorted]
+
+        out = torch.zeros(batch_size, max_n, 5, device=self.device, dtype=targets_t.dtype)
+        out[b_sorted, slot] = t_sorted
         out[..., 1:5] = xywh2xyxy(out[..., 1:5].mul_(scale_tensor))
         return out
 
