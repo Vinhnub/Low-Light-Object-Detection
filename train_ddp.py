@@ -115,6 +115,9 @@ def train_init() -> int:
     seed_torch()
     cudnn.benchmark = True
     cudnn.deterministic = False
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     cuda = opt.gpu_mode
     if cuda and not torch.cuda.is_available():
         raise Exception("No GPU found, please run without --gpu_mode False")
@@ -209,17 +212,15 @@ def train(epoch: int, local_rank: int):
                 print(f"===> [Epoch {epoch}] Closing Mosaic augmentation for final fine-tuning.")
             training_data_loader.dataset.mosaic = False
 
-    loss_print = 0.0
+    device = torch.device(f"cuda:{local_rank}" if (opt.gpu_mode and torch.cuda.is_available()) else "cpu")
+    loss_items_acc = torch.zeros(3, device=device)
+    loss_items_last10 = torch.zeros(3, device=device)
     pic_cnt = 0
-    loss_last_10 = 0.0
     pic_last_10 = 0
-
-    lbox_sum = 0.0
-    lobj_sum = 0.0
-    lcls_sum = 0.0
 
     train_len = len(training_data_loader)
     iter_cnt = 0
+    aux_label = getattr(criterion, "loss_names", ("box", "obj", "cls"))[1].capitalize()
     torch.autograd.set_detect_anomaly(opt.grad_detect)
 
     # Thiết lập sampler cho epoch hiện tại trong DDP để shuffle dữ liệu đúng cách giữa các GPU
@@ -245,6 +246,8 @@ def train(epoch: int, local_rank: int):
         if opt.gpu_mode:
             imgs = imgs.cuda(local_rank, non_blocking=True)
             targets = targets.cuda(local_rank, non_blocking=True)
+        if imgs.dtype == torch.uint8:
+            imgs = imgs.float().div_(255.0)
 
         # Random gamma illumination curve
         if opt.gamma:
@@ -277,44 +280,39 @@ def train(epoch: int, local_rank: int):
         if ema is not None:
             ema.update(model)
 
-        lbox_val, lobj_val, lcls_val = loss_items.detach().cpu().tolist()
-        total_item_loss = lbox_val + lobj_val + lcls_val
-
-        lbox_sum += lbox_val
-        lobj_sum += lobj_val
-        lcls_sum += lcls_val
-
-        loss_print += total_item_loss
-        loss_last_10 += total_item_loss
+        loss_items_acc += loss_items
+        loss_items_last10 += loss_items
         iter_cnt += 1
         pic_cnt += 1
         pic_last_10 += 1
 
-        aux_label = getattr(criterion, "loss_names", ("box", "obj", "cls"))[1].capitalize()
-        if is_master() and hasattr(data_iterator, "set_postfix"):
+        if is_master() and hasattr(data_iterator, "set_postfix") and (iter_cnt % 10 == 0 or iter_cnt == train_len):
+            lbox_avg, lobj_avg, lcls_avg = (loss_items_acc / pic_cnt).detach().cpu().tolist()
             data_iterator.set_postfix(
                 {
-                    "Total": f"{loss_print / pic_cnt:.4f}",
-                    "Box": f"{lbox_sum / pic_cnt:.4f}",
-                    aux_label: f"{lobj_sum / pic_cnt:.4f}",
-                    "Cls": f"{lcls_sum / pic_cnt:.4f}",
+                    "Total": f"{lbox_avg + lobj_avg + lcls_avg:.4f}",
+                    "Box": f"{lbox_avg:.4f}",
+                    aux_label: f"{lobj_avg:.4f}",
+                    "Cls": f"{lcls_avg:.4f}",
                     "lr": f"{optimizer.param_groups[0]['lr']:.6f}",
                 }
             )
 
         if iter_cnt == train_len and is_master():
+            lbox_avg, lobj_avg, lcls_avg = (loss_items_acc / max(1, pic_cnt)).detach().cpu().tolist()
+            last10_avg = (loss_items_last10.sum() / max(1, pic_last_10)).item()
             print(
                 "===> Epoch[{}]: Total Loss: {:.4f} || Box: {:.4f} | {}: {:.4f} | Cls: {:.4f} || lr={:.8f}.".format(
                     epoch,
-                    loss_last_10 / max(1, pic_last_10),
-                    lbox_sum / max(1, pic_cnt),
+                    last10_avg,
+                    lbox_avg,
                     aux_label,
-                    lobj_sum / max(1, pic_cnt),
-                    lcls_sum / max(1, pic_cnt),
+                    lobj_avg,
+                    lcls_avg,
                     optimizer.param_groups[0]["lr"],
                 )
             )
-            loss_last_10 = 0.0
+            loss_items_last10.zero_()
             pic_last_10 = 0
             try:
                 save_training_visual_sample(
@@ -326,13 +324,17 @@ def train(epoch: int, local_rank: int):
             except Exception as e:
                 print(f"[Warn] Could not save training preview image: {e}")
 
+    lbox_mean, lobj_mean, lcls_mean = (
+        (loss_items_acc / pic_cnt).detach().cpu().tolist() if pic_cnt > 0 else [0.0, 0.0, 0.0]
+    )
+    total_mean = lbox_mean + lobj_mean + lcls_mean
     detailed_losses = {
-        "total": loss_print / pic_cnt if pic_cnt > 0 else 0.0,
-        "box": lbox_sum / pic_cnt if pic_cnt > 0 else 0.0,
-        "obj": lobj_sum / pic_cnt if pic_cnt > 0 else 0.0,
-        "cls": lcls_sum / pic_cnt if pic_cnt > 0 else 0.0,
+        "total": total_mean,
+        "box": lbox_mean,
+        "obj": lobj_mean,
+        "cls": lcls_mean,
     }
-    return loss_print, pic_cnt, detailed_losses
+    return total_mean * pic_cnt, pic_cnt, detailed_losses
 
 
 def checkpoint(epoch: int, lr=None, tag=None):
@@ -411,6 +413,9 @@ def load_datasets():
         test_set = val_set
     else:
         raise Exception("should choose a supported dataset (exdark, darkface, voc, custom)")
+
+    if opt.gpu_mode and hasattr(train_set, "as_uint8"):
+        train_set.as_uint8 = True
 
     pin_memory = opt.gpu_mode and torch.cuda.is_available()
     use_persistent = opt.threads > 0

@@ -1,5 +1,12 @@
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# Limit CPU threads per process so DataLoader workers do not oversubscribe CPU cores
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 import random
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +19,10 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+cv2.setNumThreads(0)
+cv2.ocl.setUseOpenCL(False)
+torch.set_num_threads(1)
+
 from data.data import *
 from data.options import option
 from data.scheduler import *
@@ -22,6 +33,7 @@ from measure import VOC_CLASSES, metrics
 from net import (
     ModelEMA,
     build_yolo_model,
+    de_parallel,
     get_model_family,
     load_yolo_checkpoint,
     non_max_suppression,
@@ -45,9 +57,22 @@ def seed_torch(seed: int = None):
     os.environ["PYTHONHASHSEED"] = str(seed)
 
 
+def _dataloader_worker_init_fn(worker_id: int):
+    """Lock OpenCV and PyTorch threads inside each DataLoader worker to prevent CPU thrashing."""
+    cv2.setNumThreads(0)
+    cv2.ocl.setUseOpenCL(False)
+    torch.set_num_threads(1)
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
 def train_init():
     seed_torch()
     cudnn.benchmark = True
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     cuda = opt.gpu_mode
     if cuda and not torch.cuda.is_available():
@@ -138,18 +163,15 @@ def train(epoch):
             print(f"===> [Epoch {epoch}] Closing Mosaic augmentation for final fine-tuning.")
             training_data_loader.dataset.mosaic = False
 
-    loss_print = 0.0
+    device = torch.device("cuda" if (opt.gpu_mode and torch.cuda.is_available()) else "cpu")
+    loss_items_acc = torch.zeros(3, device=device)
+    loss_items_last10 = torch.zeros(3, device=device)
     pic_cnt = 0
-    loss_last_10 = 0.0
     pic_last_10 = 0
-
-    # Accumulators for individual YOLOv5 detection losses
-    lbox_sum = 0.0
-    lobj_sum = 0.0
-    lcls_sum = 0.0
 
     train_len = len(training_data_loader)
     iter_cnt = 0
+    aux_label = getattr(criterion, "loss_names", ("box", "obj", "cls"))[1].capitalize()
     torch.autograd.set_detect_anomaly(opt.grad_detect)
 
     pbar = tqdm(training_data_loader, desc=f"Epoch [{epoch}/{opt.nEpochs}]")
@@ -158,13 +180,15 @@ def train(epoch):
         if opt.gpu_mode:
             imgs = imgs.cuda(non_blocking=True)
             targets = targets.cuda(non_blocking=True)
+        if imgs.dtype == torch.uint8:
+            imgs = imgs.float().div_(255.0)
 
         # Optional random gamma illumination curve on tensor (matching IGMamba-EdgeLCA-LLIE)
         if opt.gamma:
             gamma = random.randint(opt.start_gamma, opt.end_gamma) / 100.0
             imgs = imgs.clamp(1e-6, 1.0) ** gamma
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         if opt.amp and opt.gpu_mode:
             with torch.amp.autocast("cuda"):
@@ -187,46 +211,40 @@ def train(epoch):
         if ema is not None:
             ema.update(model)
 
-        # loss_items = [lbox, lobj, lcls]
-        lbox_val = loss_items[0].item()
-        lobj_val = loss_items[1].item()
-        lcls_val = loss_items[2].item()
-        total_item_loss = lbox_val + lobj_val + lcls_val
-
-        lbox_sum += lbox_val
-        lobj_sum += lobj_val
-        lcls_sum += lcls_val
-
-        loss_print += total_item_loss
-        loss_last_10 += total_item_loss
+        # Accumulate loss tensors on GPU to avoid per-step CUDA-CPU sync stalls
+        loss_items_acc += loss_items
+        loss_items_last10 += loss_items
         iter_cnt += 1
         pic_cnt += 1
         pic_last_10 += 1
 
-        aux_label = getattr(criterion, "loss_names", ("box", "obj", "cls"))[1].capitalize()
-        pbar.set_postfix(
-            {
-                "Total": f"{loss_print / pic_cnt:.4f}",
-                "Box": f"{lbox_sum / pic_cnt:.4f}",
-                aux_label: f"{lobj_sum / pic_cnt:.4f}",
-                "Cls": f"{lcls_sum / pic_cnt:.4f}",
-                "lr": f"{optimizer.param_groups[0]['lr']:.6f}",
-            }
-        )
+        if iter_cnt % 10 == 0 or iter_cnt == train_len:
+            lbox_avg, lobj_avg, lcls_avg = (loss_items_acc / pic_cnt).detach().cpu().tolist()
+            pbar.set_postfix(
+                {
+                    "Total": f"{lbox_avg + lobj_avg + lcls_avg:.4f}",
+                    "Box": f"{lbox_avg:.4f}",
+                    aux_label: f"{lobj_avg:.4f}",
+                    "Cls": f"{lcls_avg:.4f}",
+                    "lr": f"{optimizer.param_groups[0]['lr']:.6f}",
+                }
+            )
 
         if iter_cnt == train_len:
+            lbox_avg, lobj_avg, lcls_avg = (loss_items_acc / max(1, pic_cnt)).detach().cpu().tolist()
+            last10_avg = (loss_items_last10.sum() / max(1, pic_last_10)).item()
             print(
                 "===> Epoch[{}]: Total Loss: {:.4f} || Box: {:.4f} | {}: {:.4f} | Cls: {:.4f} || lr={:.8f}.".format(
                     epoch,
-                    loss_last_10 / max(1, pic_last_10),
-                    lbox_sum / max(1, pic_cnt),
+                    last10_avg,
+                    lbox_avg,
                     aux_label,
-                    lobj_sum / max(1, pic_cnt),
-                    lcls_sum / max(1, pic_cnt),
+                    lobj_avg,
+                    lcls_avg,
                     optimizer.param_groups[0]["lr"],
                 )
             )
-            loss_last_10 = 0.0
+            loss_items_last10.zero_()
             pic_last_10 = 0
             try:
                 save_training_visual_sample(
@@ -239,13 +257,17 @@ def train(epoch):
             except Exception as e:
                 print(f"[Warn] Could not save training preview image: {e}")
 
+    lbox_mean, lobj_mean, lcls_mean = (
+        (loss_items_acc / pic_cnt).detach().cpu().tolist() if pic_cnt > 0 else [0.0, 0.0, 0.0]
+    )
+    total_mean = lbox_mean + lobj_mean + lcls_mean
     detailed_losses = {
-        "total": loss_print / pic_cnt if pic_cnt > 0 else 0.0,
-        "box": lbox_sum / pic_cnt if pic_cnt > 0 else 0.0,
-        "obj": lobj_sum / pic_cnt if pic_cnt > 0 else 0.0,
-        "cls": lcls_sum / pic_cnt if pic_cnt > 0 else 0.0,
+        "total": total_mean,
+        "box": lbox_mean,
+        "obj": lobj_mean,
+        "cls": lcls_mean,
     }
-    return loss_print, pic_cnt, detailed_losses
+    return total_mean * pic_cnt, pic_cnt, detailed_losses
 
 
 def checkpoint(epoch, lr=None, tag=None):
@@ -277,13 +299,14 @@ def checkpoint(epoch, lr=None, tag=None):
 
 def load_datasets():
     print(f"===> Loading datasets: {opt.dataset}")
+    test_no_cache_hyp = {"cache_images": False}
     if opt.dataset == "exdark":
         train_set = get_exdark_training_set(
             opt.data_train_exdark, size=opt.imgSize, hyp=opt
         )
-        val_set = get_exdark_val_set(opt.data_val_exdark, size=opt.imgSize)
+        val_set = get_exdark_val_set(opt.data_val_exdark, size=opt.imgSize, hyp=opt)
         test_set = (
-            get_exdark_test_set(opt.data_test_exdark, size=opt.imgSize)
+            get_exdark_test_set(opt.data_test_exdark, size=opt.imgSize, hyp=test_no_cache_hyp)
             if os.path.exists(opt.data_test_exdark)
             else val_set
         )
@@ -291,14 +314,14 @@ def load_datasets():
         train_set = get_darkface_training_set(
             opt.data_train_darkface, size=opt.imgSize, hyp=opt
         )
-        val_set = get_darkface_val_set(opt.data_val_darkface, size=opt.imgSize)
+        val_set = get_darkface_val_set(opt.data_val_darkface, size=opt.imgSize, hyp=opt)
         test_set = val_set
     elif opt.dataset == "voc":
         train_set = get_training_set(
             opt.data_train_voc, size=opt.imgSize, dataset_name="voc", hyp=opt
         )
         val_set = get_eval_set(
-            opt.data_val_voc, size=opt.imgSize, dataset_name="voc"
+            opt.data_val_voc, size=opt.imgSize, dataset_name="voc", hyp=opt
         )
         test_set = val_set
     elif opt.dataset == "custom":
@@ -306,15 +329,21 @@ def load_datasets():
             opt.data_train_custom, size=opt.imgSize, dataset_name="custom", hyp=opt
         )
         val_set = get_eval_set(
-            opt.data_val_custom, size=opt.imgSize, dataset_name="custom"
+            opt.data_val_custom, size=opt.imgSize, dataset_name="custom", hyp=opt
         )
         test_set = val_set
     else:
         raise Exception("should choose a supported dataset (exdark, darkface, voc, custom)")
 
+    if opt.gpu_mode and hasattr(train_set, "as_uint8"):
+        train_set.as_uint8 = True
+
     pin_memory = opt.gpu_mode and torch.cuda.is_available()
     use_persistent = opt.threads > 0
-    prefetch = 4 if opt.threads > 0 else None
+    prefetch = 2 if opt.threads > 0 else None
+    val_workers = 0 if os.name == "nt" else min(2, max(1, opt.threads))
+    eval_batch_size = max(1, opt.batchSize * 2)
+
     training_data_loader = DataLoader(
         dataset=train_set,
         num_workers=opt.threads,
@@ -323,22 +352,26 @@ def load_datasets():
         pin_memory=pin_memory,
         persistent_workers=use_persistent,
         prefetch_factor=prefetch,
+        worker_init_fn=_dataloader_worker_init_fn,
         collate_fn=collate_fn,
     )
     testing_data_loader = DataLoader(
         dataset=val_set,
-        num_workers=0,
-        batch_size=opt.batchSize,
+        num_workers=val_workers,
+        batch_size=eval_batch_size,
         shuffle=False,
         pin_memory=pin_memory,
+        persistent_workers=(val_workers > 0),
+        worker_init_fn=_dataloader_worker_init_fn,
         collate_fn=collate_fn,
     )
     final_test_data_loader = DataLoader(
         dataset=test_set,
-        num_workers=0,
-        batch_size=opt.batchSize,
+        num_workers=val_workers,
+        batch_size=eval_batch_size,
         shuffle=False,
         pin_memory=pin_memory,
+        worker_init_fn=_dataloader_worker_init_fn,
         collate_fn=collate_fn,
     )
     print(

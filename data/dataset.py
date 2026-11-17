@@ -112,6 +112,7 @@ class YOLODataset(Dataset):
             if cache_images is None
             else bool(cache_images)
         )
+        self.as_uint8 = bool(self.hyp.get("as_uint8", False))
 
         # Collect image files
         self.im_files = self._resolve_image_files(path)
@@ -525,10 +526,13 @@ class YOLODataset(Dataset):
         if nl:
             labels_out[:, 1:] = torch.from_numpy(labels)
 
-        # Convert BGR HWC to RGB CHW, float32 in [0.0, 1.0]
+        # Convert BGR HWC to RGB CHW; optionally defer float32/255 conversion to GPU to save 4x IPC/RAM bandwidth
         img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
-        img = np.ascontiguousarray(img, dtype=np.float32) / 255.0
+        if self.as_uint8:
+            img = np.ascontiguousarray(img)
+            return torch.from_numpy(img), labels_out, self.im_files[index], shapes
 
+        img = np.ascontiguousarray(img, dtype=np.float32) / 255.0
         return torch.from_numpy(img), labels_out, self.im_files[index], shapes
 
     @staticmethod
