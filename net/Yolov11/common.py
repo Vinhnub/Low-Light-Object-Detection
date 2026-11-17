@@ -748,12 +748,14 @@ class EdgeExtractor(nn.Module):
         use_blur: bool = True,
         blur_kernel_size: int = 3,
         blur_sigma: float = 1.0,
+        weber_log: bool = True,
     ):
         super().__init__()
         self.in_channels = in_channels
         self.rgb_to_gray = rgb_to_gray and (in_channels == 3)
         self.use_blur = use_blur
         self.blur_kernel_size = blur_kernel_size
+        self.weber_log = weber_log
 
         if self.rgb_to_gray:
             self.register_buffer(
@@ -792,6 +794,8 @@ class EdgeExtractor(nn.Module):
         self.channel_fusion = nn.Conv2d(3, 1, kernel_size=1, bias=False)
         self.scale = nn.Parameter(torch.tensor(10.0))
         self.offset = nn.Parameter(torch.tensor(-5.0))
+        if self.weber_log:
+            self.weber_alpha = nn.Parameter(torch.tensor(0.7))
 
     @staticmethod
     def _create_gaussian_kernel(kernel_size: int, sigma: float) -> torch.Tensor:
@@ -824,6 +828,14 @@ class EdgeExtractor(nn.Module):
             target_blur_pad = F.pad(target, (pad, pad, pad, pad), mode="replicate")
             target = F.conv2d(target_blur_pad, self.gaussian_kernel.to(dtype=target.dtype))
 
+        if getattr(self, "weber_log", True):
+            eps = 1e-3
+            log_min = math.log(eps)
+            t_fp32 = target.float()
+            target_log = (torch.log(t_fp32.clamp(min=eps)) - log_min) / (-log_min)
+            alpha = self.weber_alpha.float().clamp(0.0, 1.0)
+            target = (alpha * target_log + (1.0 - alpha) * t_fp32).to(dtype=x.dtype)
+
         target_padded = F.pad(target, (1, 1, 1, 1), mode="replicate")
         grad_x = F.conv2d(target_padded, self.sobel_x.to(dtype=target.dtype))
         grad_y = F.conv2d(target_padded, self.sobel_y.to(dtype=target.dtype))
@@ -841,6 +853,22 @@ class EdgeExtractor(nn.Module):
 
         priority_score = self.scale.float() * grad_norm + self.offset.float()
         return torch.sigmoid(priority_score).to(dtype=x.dtype)
+
+
+class MultiScaleEdgeGate(nn.Module):
+    """Multi-scale spatial edge gating combining 3x3 sharp local and dilated 3x3 wide edge contexts."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.local_conv = nn.Conv2d(1, dim, kernel_size=3, padding=1, bias=True)
+        self.wide_dwconv = nn.Conv2d(
+            dim, dim, kernel_size=3, padding=2, dilation=2, groups=dim, bias=True
+        )
+        self.act = nn.Sigmoid()
+
+    def forward(self, edge: torch.Tensor) -> torch.Tensor:
+        feat = self.local_conv(edge)
+        return self.act(feat + self.wide_dwconv(feat))
 
 
 class EdgeCAB(nn.Module):
@@ -888,10 +916,12 @@ class EdgeCAB(nn.Module):
             groups=inner_dim * 2,
             bias=bias,
         )
-        # bias=True lets large-object interior regions at P5 learn an open gate bias
-        self.edge_gate = nn.Sequential(
-            nn.Conv2d(1, dim, kernel_size=3, padding=1, bias=True),
-            nn.Sigmoid(),
+        self.edge_gate = MultiScaleEdgeGate(dim)
+        self.ffn_gate = nn.Sequential(
+            nn.Conv2d(
+                inner_dim, inner_dim, kernel_size=3, stride=1, padding=1, groups=inner_dim, bias=False
+            ),
+            nn.SiLU(inplace=True),
         )
         self.project_out = nn.Conv2d(inner_dim, dim, kernel_size=1, bias=bias)
 
@@ -940,6 +970,7 @@ class EdgeCAB(nn.Module):
         attn = F.softmax(attn, dim=-1)
 
         out = (attn @ v.float()).to(x.dtype).reshape(b, self.inner_dim, h, w)
+        out = out * self.ffn_gate(out)
         out = self.project_out(out)
 
         if edge_scaled is not None:
