@@ -40,14 +40,14 @@ from .common import (
     C3k,
     C3k2,
     C3x,
-    CAB,
+    SAB,
     Concat,
     Conv,
     Conv2,
     ConvTranspose,
     DWConv,
     DWConvTranspose2d,
-    EdgeCAB,
+    EdgeSAB,
     EdgeExtractor,
     Focus,
     GhostBottleneck,
@@ -122,9 +122,9 @@ def get_yolov11_cfg_dict(
             [-1, 1, "Conv", [512, 3, 2]],                  # 20
             [[-1, 10], 1, "Concat", [1]],                  # 21 cat head P5
             [-1, 2, "C3k2", [1024, True]],                 # 22 (P5/32-large)
-            [16, 1, "EdgeCAB", [4, False, 2]],             # 23 (P3/8-small EdgeCAB self-attn)
-            [19, 1, "EdgeCAB", [4, False, 2]],             # 24 (P4/16-medium EdgeCAB self-attn)
-            [22, 1, "EdgeCAB", [4, False, 2]],             # 25 (P5/32-large EdgeCAB self-attn)
+            [16, 1, "EdgeSAB", [4, False, 2]],             # 23 (P3/8-small EdgeSAB self-attn)
+            [19, 1, "EdgeSAB", [4, False, 2]],             # 24 (P4/16-medium EdgeSAB self-attn)
+            [22, 1, "EdgeSAB", [4, False, 2]],             # 25 (P5/32-large EdgeSAB self-attn)
             [[23, 24, 25], 1, "Detect", ["nc"]],           # 26 Detect(P3, P4, P5)
         ],
     }
@@ -642,8 +642,8 @@ def parse_model(
         "C2PSA": C2PSA,
         "SCDown": SCDown,
         "CBAM": CBAM,
-        "CAB": CAB,
-        "EdgeCAB": EdgeCAB,
+        "SAB": SAB,
+        "EdgeSAB": EdgeSAB,
         "Concat": Concat,
         "Proto": Proto,
         "Detect": Detect,
@@ -683,7 +683,7 @@ def parse_model(
             args = [ch_list[f]]
         elif m is Concat:
             c2 = sum(ch_list[x] for x in f)
-        elif m in {CAB, EdgeCAB}:
+        elif m in {SAB, EdgeSAB}:
             c1 = ch_list[f] if isinstance(f, int) else ch_list[f[0]]
             c2 = c1
             args = [c1, *args]
@@ -740,7 +740,7 @@ class BaseModel(nn.Module):
                     if isinstance(m.f, int)
                     else [x if j == -1 else y[j] for j in m.f]
                 )
-            if isinstance(m, (CAB, EdgeCAB)):
+            if isinstance(m, (SAB, EdgeSAB)):
                 x = m(x, edge_map=edge_map)
             else:
                 x = m(x)
@@ -1104,10 +1104,10 @@ class YOLOv11Neck(nn.Module):
         self.down_p4 = Conv(c4_out, c4_out, k=3, s=2)  # Layer 20
         self.c3k2_n5 = C3k2(c4_out + c5, c5_out, n=d(2), c3k=True)  # Layer 22 (N5/32)
 
-        # Pre-Head Edge-Guided Transposed Self-Attention refinement
-        self.attn_p3 = EdgeCAB(c3_out, num_heads=num_heads, bias=False, reduction=2)  # Layer 23
-        self.attn_p4 = EdgeCAB(c4_out, num_heads=num_heads, bias=False, reduction=2)  # Layer 24
-        self.attn_p5 = EdgeCAB(c5_out, num_heads=num_heads, bias=False, reduction=2)  # Layer 25
+        # Pre-Head Edge-Guided Self-Attention refinement
+        self.attn_p3 = EdgeSAB(c3_out, num_heads=num_heads, bias=False, reduction=2)  # Layer 23
+        self.attn_p4 = EdgeSAB(c4_out, num_heads=num_heads, bias=False, reduction=2)  # Layer 24
+        self.attn_p5 = EdgeSAB(c5_out, num_heads=num_heads, bias=False, reduction=2)  # Layer 25
 
     def forward(
         self,
@@ -1124,7 +1124,7 @@ class YOLOv11Neck(nn.Module):
         n4 = self.c3k2_n4(torch.cat([self.down_p3(n3), f_p4], dim=1))
         n5 = self.c3k2_n5(torch.cat([self.down_p4(n4), p5], dim=1))
 
-        # Pre-Head EdgeCAB Self-Attention
+        # Pre-Head EdgeSAB Self-Attention
         n3 = self.attn_p3(n3, edge_map=edge_map)
         n4 = self.attn_p4(n4, edge_map=edge_map)
         n5 = self.attn_p5(n5, edge_map=edge_map)

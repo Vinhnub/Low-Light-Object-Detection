@@ -98,7 +98,7 @@ def smart_optimizer(
         elif hasattr(v, "weight") and isinstance(v.weight, nn.Parameter):
             g[1].append(v.weight)
 
-    # Catch standalone nn.Parameter attributes (e.g., EdgeCAB.temperature, gamma, edge_scale, EdgeExtractor.scale/offset)
+    # Catch standalone nn.Parameter attributes (e.g., EdgeSAB.temperature, gamma, edge_scale, EdgeExtractor.scale/offset)
     included = {id(p) for group in g for p in group}
     for p in de_parallel(model).parameters():
         if id(p) not in included:
@@ -174,9 +174,9 @@ def _register_ultralytics_unpickle_aliases() -> None:
         "C3k",
         "C3k2",
         "C3x",
-        "CAB",
+        "SAB",
         "DFL",
-        "EdgeCAB",
+        "EdgeSAB",
         "EdgeExtractor",
         "GhostBottleneck",
         "PSA",
@@ -288,7 +288,7 @@ def load_yolov11_checkpoint(
                 else m_obj
             )
 
-    # Bidirectional mapping across 24-layer official, 27-layer EdgeCAB, and modular YOLOv11 models
+    # Bidirectional mapping across 24-layer official, 27-layer EdgeSAB, and modular YOLOv11 models
     base_seq_to_mod = {
         "model.0.": "backbone.stem.",
         "model.1.": "backbone.stage1.0.",

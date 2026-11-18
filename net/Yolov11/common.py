@@ -871,9 +871,9 @@ class MultiScaleEdgeGate(nn.Module):
         return self.act(feat + self.wide_dwconv(feat))
 
 
-class EdgeCAB(nn.Module):
+class EdgeSAB(nn.Module):
     """
-    Pre-Head Edge-Guided Transposed Channel Attention Block (MDTA-style)
+    Pre-Head Edge-Guided Transposed Channel Self-Attention Block (MDTA-style)
     with residual gating (`x + gamma * out`). Supports Self-Attention (`y=None`)
     and Cross-Attention (`y` or `[x, y]`).
     """
@@ -979,7 +979,7 @@ class EdgeCAB(nn.Module):
         return x + self.gamma * out
 
 
-CAB = EdgeCAB
+SAB = EdgeSAB
 
 
 class C3k2(C2f):
