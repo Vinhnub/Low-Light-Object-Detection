@@ -102,6 +102,18 @@ YOLOV5_LAYER_META: Dict[int, Tuple[str, str]] = {
     24: ("Head", "L24_Detect_P3_P4_P5"),
 }
 
+# Semantic annotations for 28-layer EdgeSAB YOLOv5
+YOLOV5_EDGESAB_LAYER_META: Dict[int, Tuple[str, str]] = {
+    **YOLOV5_LAYER_META,
+    17: ("PAN_Neck", "L17_PAN_C3_N3_P3_8"),
+    20: ("PAN_Neck", "L20_PAN_C3_N4_P4_16"),
+    23: ("PAN_Neck", "L23_PAN_C3_N5_P5_32"),
+    24: ("PAN_HeadIn", "L24_EdgeSAB_N3_P3_8"),
+    25: ("PAN_HeadIn", "L25_EdgeSAB_N4_P4_16"),
+    26: ("PAN_HeadIn", "L26_EdgeSAB_N5_P5_32"),
+    27: ("Head", "L27_Detect_P3_P4_P5"),
+}
+
 COLORMAP_TABLE: Dict[str, int] = {
     "turbo": getattr(cv2, "COLORMAP_TURBO", cv2.COLORMAP_JET),
     "inferno": cv2.COLORMAP_INFERNO,
@@ -517,13 +529,17 @@ class YOLOv5FeatureRecorder:
 
     def _register(self) -> None:
         if hasattr(self.model, "model") and isinstance(self.model.model, nn.Sequential):
+            has_edgesab = any(
+                type(m).__name__ in {"EdgeSAB", "SAB"} for m in self.model.model
+            )
+            meta_table = YOLOV5_EDGESAB_LAYER_META if has_edgesab else YOLOV5_LAYER_META
             for idx, mod in enumerate(self.model.model):
-                stage, label = YOLOV5_LAYER_META.get(idx, ("Layer", f"L{idx:02d}_{type(mod).__name__}"))
+                stage, label = meta_table.get(idx, ("Layer", f"L{idx:02d}_{type(mod).__name__}"))
                 mod_type = type(mod).__name__
                 self.handles.append(
                     mod.register_forward_hook(self._make_hook(label, stage, idx, mod_type, False))
                 )
-                if self.capture_sublayers and mod_type in {"C3", "SPPF", "C3TR", "C3SPP", "C3Ghost", "SPP"}:
+                if self.capture_sublayers and mod_type in {"C3", "SPPF", "C3TR", "C3SPP", "C3Ghost", "SPP", "EdgeSAB", "SAB"}:
                     for sub_name, sub_mod in mod.named_children():
                         sub_key = f"{label}.{sub_name}"
                         self.handles.append(
@@ -543,20 +559,29 @@ class YOLOv5FeatureRecorder:
                     ("Backbone", "L06_Stage3_P4_16", 6, bb.stage3),
                     ("Backbone", "L09_Stage4_SPPF_P5_32", 9, bb.stage4),
                 ])
+            has_edgesab = False
             if hasattr(self.model, "neck"):
                 nk = self.model.neck
+                has_edgesab = hasattr(nk, "attn_p3")
                 modular_points.extend([
                     ("FPN_Neck", "L10_FPN_ReduceP5", 10, nk.reduce_p5),
                     ("FPN_Neck", "L13_FPN_C3_P4", 13, nk.c3_p4),
                     ("FPN_Neck", "L14_FPN_ReduceP4", 14, nk.reduce_p4),
-                    ("PAN_HeadIn", "L17_NeckOut_N3_P3_8", 17, nk.c3_p3),
+                    ("PAN_Neck" if has_edgesab else "PAN_HeadIn", "L17_NeckOut_N3_P3_8", 17, nk.c3_p3),
                     ("PAN_Neck", "L18_PAN_DownP3", 18, nk.down_p3),
-                    ("PAN_HeadIn", "L20_NeckOut_N4_P4_16", 20, nk.c3_n4),
+                    ("PAN_Neck" if has_edgesab else "PAN_HeadIn", "L20_NeckOut_N4_P4_16", 20, nk.c3_n4),
                     ("PAN_Neck", "L21_PAN_DownP4", 21, nk.down_p4),
-                    ("PAN_HeadIn", "L23_NeckOut_N5_P5_32", 23, nk.c3_n5),
+                    ("PAN_Neck" if has_edgesab else "PAN_HeadIn", "L23_NeckOut_N5_P5_32", 23, nk.c3_n5),
                 ])
+                if has_edgesab:
+                    modular_points.extend([
+                        ("PAN_HeadIn", "L24_EdgeSAB_N3_P3_8", 24, nk.attn_p3),
+                        ("PAN_HeadIn", "L25_EdgeSAB_N4_P4_16", 25, nk.attn_p4),
+                        ("PAN_HeadIn", "L26_EdgeSAB_N5_P5_32", 26, nk.attn_p5),
+                    ])
             if hasattr(self.model, "head"):
-                modular_points.append(("Head", "L24_Detect_P3_P4_P5", 24, self.model.head))
+                det_idx = 27 if has_edgesab else 24
+                modular_points.append(("Head", f"L{det_idx:02d}_Detect_P3_P4_P5", det_idx, self.model.head))
 
             for stage, label, idx, mod in modular_points:
                 self.handles.append(
@@ -857,10 +882,15 @@ def save_network_overview(
         )
 
     # Pick representative milestones across Backbone -> FPN -> PAN -> Head so grid forms a full 4x4 layout
+    has_edgesab = any(
+        r["layer_idx"] in {24, 25, 26} and r.get("mod_type") in {"EdgeSAB", "SAB"}
+        for r in records.values()
+        if not r["is_sublayer"]
+    )
     if gt_bgr is not None:
-        key_indices = {0, 2, 4, 6, 8, 9, 13, 17, 20, 23}
+        key_indices = {0, 2, 4, 6, 8, 9, 13, 24, 25, 26} if has_edgesab else {0, 2, 4, 6, 8, 9, 13, 17, 20, 23}
     else:
-        key_indices = {0, 2, 4, 6, 8, 9, 10, 13, 17, 20, 23}
+        key_indices = {0, 2, 4, 6, 8, 9, 10, 13, 24, 25, 26} if has_edgesab else {0, 2, 4, 6, 8, 9, 10, 13, 17, 20, 23}
     stage_colors = {
         "Backbone": (255, 170, 50),
         "FPN_Neck": (255, 110, 210),
@@ -942,10 +972,14 @@ def save_backbone_vs_neck_scales(
     base_tile_img = resize_to_panel(display_bgr, pw)
 
     by_idx = {r["layer_idx"]: r for r in records.values() if not r["is_sublayer"] and "tensor" in r}
+    has_edgesab = any(
+        r["layer_idx"] in {24, 25, 26} and r.get("mod_type") in {"EdgeSAB", "SAB"}
+        for r in by_idx.values()
+    )
     scale_pairs = [
-        ("P3/8 (Small)", 4, 17, 0),
-        ("P4/16 (Medium)", 6, 20, 1),
-        ("P5/32 (Large)", 9, 23, 2),
+        ("P3/8 (Small)", 4, 24 if has_edgesab else 17, 0),
+        ("P4/16 (Medium)", 6, 25 if has_edgesab else 20, 1),
+        ("P5/32 (Large)", 9, 26 if has_edgesab else 23, 2),
     ]
 
     tiles: List[np.ndarray] = []

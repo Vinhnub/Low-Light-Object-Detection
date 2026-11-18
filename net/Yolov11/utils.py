@@ -98,6 +98,12 @@ def smart_optimizer(
         elif hasattr(v, "weight") and isinstance(v.weight, nn.Parameter):
             g[1].append(v.weight)
 
+    # Catch standalone nn.Parameter attributes (e.g., EdgeSAB.temperature, gamma, edge_scale, EdgeExtractor.scale/offset/weber_alpha)
+    included = {id(p) for group in g for p in group}
+    for p in de_parallel(model).parameters():
+        if id(p) not in included:
+            g[2].append(p)
+
     opt_name = name.upper()
     if opt_name == "ADAM":
         optimizer = torch.optim.Adam(g[2], lr=lr, betas=(momentum, 0.999))

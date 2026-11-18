@@ -36,11 +36,14 @@ from .common import (
     CrossConv,
     DWConv,
     DWConvTranspose2d,
+    EdgeExtractor,
+    EdgeSAB,
     Expand,
     Focus,
     GhostBottleneck,
     GhostConv,
     Proto,
+    SAB,
     TransformerBlock,
 )
 from .utils import (
@@ -117,7 +120,10 @@ def get_yolov5_cfg_dict(
             [-1, 1, "Conv", [512, 3, 2]],            # 21
             [[-1, 10], 1, "Concat", [1]],            # 22 cat head P5
             [-1, 3, "C3", [1024, False]],            # 23 (P5/32-large)
-            [[17, 20, 23], 1, "Detect", ["nc", "anchors"]],  # 24 Detect(P3, P4, P5)
+            [17, 1, "EdgeSAB", [4, False, 2]],       # 24 (P3/8-small EdgeSAB self-attn)
+            [20, 1, "EdgeSAB", [4, False, 2]],       # 25 (P4/16-medium EdgeSAB self-attn)
+            [23, 1, "EdgeSAB", [4, False, 2]],       # 26 (P5/32-large EdgeSAB self-attn)
+            [[24, 25, 26], 1, "Detect", ["nc", "anchors"]],  # 27 Detect(P3, P4, P5)
         ],
     }
 
@@ -314,6 +320,8 @@ def parse_model(
         "Contract": Contract,
         "Expand": Expand,
         "Concat": Concat,
+        "SAB": SAB,
+        "EdgeSAB": EdgeSAB,
         "Proto": Proto,
         "Detect": Detect,
         "Segment": Segment,
@@ -361,6 +369,10 @@ def parse_model(
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
+        elif m in {SAB, EdgeSAB}:
+            c1 = ch[f] if isinstance(f, int) else ch[f[0]]
+            c2 = c1
+            args = [c1, *args]
         elif m in {Detect, Segment}:
             args.append([ch[x] for x in f])
             if isinstance(args[1], int):  # number of anchors
@@ -404,6 +416,11 @@ class BaseModel(nn.Module):
     def _forward_once(
         self, x: torch.Tensor, profile: bool = False, visualize: bool = False
     ):
+        edge_map = (
+            self.edge_extractor(x)
+            if hasattr(self, "edge_extractor") and self.edge_extractor is not None
+            else None
+        )
         y = []  # outputs
         for m in self.model:
             if m.f != -1:  # if not from previous layer
@@ -412,7 +429,10 @@ class BaseModel(nn.Module):
                     if isinstance(m.f, int)
                     else [x if j == -1 else y[j] for j in m.f]
                 )  # from earlier layers
-            x = m(x)  # run
+            if isinstance(m, (SAB, EdgeSAB)):
+                x = m(x, edge_map=edge_map)
+            else:
+                x = m(x)  # run
             y.append(x if m.i in self.save else None)  # save output
         return x
 
@@ -498,6 +518,7 @@ class DetectionModel(BaseModel):
             self.yaml["anchors"] = anchors  # override yaml value
 
         self.model, self.save = parse_model(copy.deepcopy(self.yaml), ch=[ch])
+        self.edge_extractor = EdgeExtractor(in_channels=ch, rgb_to_gray=(ch == 3))
         self.names = [str(i) for i in range(self.yaml["nc"])]  # default names
         self.inplace = self.yaml.get("inplace", True)
 
@@ -511,12 +532,15 @@ class DetectionModel(BaseModel):
                 if isinstance(m, Segment)
                 else self.forward(x)
             )
+            self.model.eval()
+            m.training = True
             m.stride = torch.tensor(
                 [s / x.shape[-2] for x in forward(torch.zeros(1, ch, s, s))]
             )  # forward
             check_anchor_order(m)
             m.anchors /= m.stride.view(-1, 1, 1)
             self.stride = m.stride
+            self.model.train()
             self._initialize_biases()  # only run once
 
         # Init weights, biases
@@ -725,6 +749,7 @@ class YOLOv5Neck(nn.Module):
         self,
         in_channels: Tuple[int, int, int] = (128, 256, 512),
         depth_multiple: float = 0.33,
+        num_heads: int = 4,
     ):
         super().__init__()
         c3, c4, c5 = in_channels
@@ -747,8 +772,15 @@ class YOLOv5Neck(nn.Module):
         self.down_p4 = Conv(c4, c4, k=3, s=2)               # Layer 21
         self.c3_n5 = C3(c4 + c4, c5, n=d(3), shortcut=False)  # Layer 23 (N5/32 out)
 
+        # Pre-Head Edge-Guided Self-Attention refinement
+        self.attn_p3 = EdgeSAB(c3, num_heads=num_heads, bias=False, reduction=2)  # Layer 24
+        self.attn_p4 = EdgeSAB(c4, num_heads=num_heads, bias=False, reduction=2)  # Layer 25
+        self.attn_p5 = EdgeSAB(c5, num_heads=num_heads, bias=False, reduction=2)  # Layer 26
+
     def forward(
-        self, features: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        self,
+        features: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        edge_map: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         p3, p4, p5 = features
 
@@ -762,6 +794,11 @@ class YOLOv5Neck(nn.Module):
         # Bottom-up PAN
         n4 = self.c3_n4(torch.cat([self.down_p3(n3), f_p4_reduced], dim=1))
         n5 = self.c3_n5(torch.cat([self.down_p4(n4), f_p5], dim=1))
+
+        # Pre-Head EdgeSAB Self-Attention
+        n3 = self.attn_p3(n3, edge_map=edge_map)
+        n4 = self.attn_p4(n4, edge_map=edge_map)
+        n5 = self.attn_p5(n5, edge_map=edge_map)
 
         return [n3, n4, n5]
 
@@ -794,6 +831,7 @@ class YOLOv5(nn.Module):
         self.variant = variant
         self.names = [str(i) for i in range(num_classes)]
 
+        self.edge_extractor = EdgeExtractor(in_channels=in_channels, rgb_to_gray=(in_channels == 3))
         self.backbone = YOLOv5Backbone(
             in_channels=in_channels,
             depth_multiple=depth_multiple,
@@ -834,13 +872,15 @@ class YOLOv5(nn.Module):
         self, x: torch.Tensor
     ) -> Tuple[Tuple[torch.Tensor, ...], List[torch.Tensor]]:
         """Extract both backbone features (P3, P4, P5) and neck features [N3, N4, N5]."""
+        edge_map = self.edge_extractor(x)
         backbone_feats = self.backbone(x)
-        neck_feats = self.neck(backbone_feats)
+        neck_feats = self.neck(backbone_feats, edge_map=edge_map)
         return backbone_feats, neck_feats
 
     def forward(self, x: torch.Tensor):
+        edge_map = self.edge_extractor(x)
         p3, p4, p5 = self.backbone(x)
-        neck_feats = self.neck((p3, p4, p5))
+        neck_feats = self.neck((p3, p4, p5), edge_map=edge_map)
         return self.head(neck_feats)
 
     def fuse(self):

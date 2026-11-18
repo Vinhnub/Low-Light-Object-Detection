@@ -490,6 +490,24 @@ def make_scheduler(lr=None):
     return optimizer, scheduler
 
 
+def set_backbone_trainable(net: torch.nn.Module, trainable: bool) -> None:
+    """Freeze or unfreeze backbone parameters for staged fine-tuning."""
+    raw_net = de_parallel(net)
+    if hasattr(raw_net, "backbone"):
+        target = raw_net.backbone
+    elif hasattr(raw_net, "model") and isinstance(raw_net.model, torch.nn.Sequential):
+        n_backbone = (
+            len(raw_net.yaml["backbone"])
+            if hasattr(raw_net, "yaml") and isinstance(raw_net.yaml, dict) and "backbone" in raw_net.yaml
+            else 10
+        )
+        target = raw_net.model[:n_backbone]
+    else:
+        return
+    for p in target.parameters():
+        p.requires_grad = trainable
+
+
 def init_loss():
     criterion_fn = ComputeLoss(model, hyp=opt, iou_type=opt.iou_type)
     return criterion_fn
@@ -621,7 +639,18 @@ if __name__ == "__main__":
         val_label_dir = opt.data_valgt_custom
         test_label_dir = opt.data_valgt_custom
 
+    if opt.freeze_epochs > 0 and start_epoch < opt.freeze_epochs:
+        set_backbone_trainable(model, False)
+        print(
+            f"===> [Staged Fine-Tuning] Đóng băng Backbone trong {opt.freeze_epochs} epochs đầu (đến epoch {opt.freeze_epochs})."
+        )
+
     for epoch in range(start_epoch + 1, opt.nEpochs + 1):
+        if opt.freeze_epochs > 0 and epoch == opt.freeze_epochs + 1:
+            set_backbone_trainable(model, True)
+            print(
+                f"===> [Epoch {epoch}] Mở khóa toàn bộ Backbone để fine-tune end-to-end."
+            )
         current_lr = optimizer.param_groups[0]["lr"]
         epoch_loss, pic_num, detailed_losses = train(epoch)
         scheduler.step()

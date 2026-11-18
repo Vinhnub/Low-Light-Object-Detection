@@ -161,6 +161,12 @@ def option():
         default=False,
         help="turn True to train with warmup",
     )
+    parser.add_argument(
+        "--freeze_epochs",
+        type=int,
+        default=0,
+        help="Number of initial epochs to freeze backbone parameters",
+    )
 
     # 3. Dataset paths & Selection
     parser.add_argument(

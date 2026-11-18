@@ -109,6 +109,12 @@ def smart_optimizer(
         ):  # weight (with decay)
             g[1].append(v.weight)
 
+    # Catch standalone nn.Parameter attributes (e.g., EdgeSAB.temperature, gamma, edge_scale, EdgeExtractor.scale/offset/weber_alpha)
+    included = {id(p) for group in g for p in group}
+    for p in de_parallel(model).parameters():
+        if id(p) not in included:
+            g[2].append(p)
+
     opt_name = name.upper()
     if opt_name == "ADAM":
         optimizer = torch.optim.Adam(
@@ -207,8 +213,8 @@ def load_yolov5_checkpoint(
                 else m_obj
             )
 
-    # Map sequential `model.0..24.*` keys to modular `backbone.*` / `neck.*` / `head.*` if needed
-    seq_to_mod_prefix = {
+    # Bidirectional mapping across 25-layer official, 28-layer EdgeSAB, and modular YOLOv5 models
+    base_seq_to_mod = {
         "model.0.": "backbone.stem.",
         "model.1.": "backbone.stage1.0.",
         "model.2.": "backbone.stage1.1.",
@@ -227,24 +233,67 @@ def load_yolov5_checkpoint(
         "model.20.": "neck.c3_n4.",
         "model.21.": "neck.down_p4.",
         "model.23.": "neck.c3_n5.",
-        "model.24.": "head.",
     }
+    seq25_to_mod = {**base_seq_to_mod, "model.24.": "head."}
+    seq28_to_mod = {
+        **base_seq_to_mod,
+        "model.24.": "neck.attn_p3.",
+        "model.25.": "neck.attn_p4.",
+        "model.26.": "neck.attn_p5.",
+        "model.27.": "head.",
+    }
+    seq25_to_seq28 = {"model.24.": "model.27."}
+    seq28_to_seq25 = {"model.27.": "model.24."}
+    mod_to_seq28 = {v: k for k, v in seq28_to_mod.items()}
+    mod_to_seq25 = {v: k for k, v in seq25_to_mod.items()}
 
-    model_dict = model.state_dict()
+    clean_keys = [k[7:] if k.startswith("module.") else k for k in raw_state_dict.keys()]
+    src_is_28 = any(k.startswith("model.27.") for k in clean_keys)
+    src_is_mod = any(k.startswith("backbone.") for k in clean_keys)
+    src_is_25 = (
+        any(k.startswith("model.24.m.") or k.startswith("model.24.anchors") for k in clean_keys)
+        and not src_is_28
+    )
+
+    target_model = de_parallel(model)
+    model_dict = target_model.state_dict()
+    dst_is_28 = any(k.startswith("model.27.") for k in model_dict)
+    dst_is_mod = any(k.startswith("backbone.") for k in model_dict)
+    dst_is_25 = (
+        any(k.startswith("model.24.m.") or k.startswith("model.24.anchors") for k in model_dict)
+        and not dst_is_28
+    )
+
+    prefix_map: Dict[str, str] = {}
+    if dst_is_mod and src_is_25:
+        prefix_map = seq25_to_mod
+    elif dst_is_mod and src_is_28:
+        prefix_map = seq28_to_mod
+    elif dst_is_28 and src_is_25:
+        prefix_map = seq25_to_seq28
+    elif dst_is_28 and src_is_mod:
+        prefix_map = mod_to_seq28
+    elif dst_is_25 and src_is_mod:
+        prefix_map = mod_to_seq25
+    elif dst_is_25 and src_is_28:
+        prefix_map = seq28_to_seq25
+
     filtered_state_dict = {}
     for k, v in raw_state_dict.items():
         name = k[7:] if k.startswith("module.") else k
         if isinstance(v, torch.Tensor) and v.is_floating_point():
             v = v.float()
-        if name not in model_dict:
-            for seq_p, mod_p in seq_to_mod_prefix.items():
-                if name.startswith(seq_p):
-                    name = mod_p + name[len(seq_p) :]
-                    break
+        if name not in model_dict and prefix_map:
+            for src_p, dst_p in prefix_map.items():
+                if name.startswith(src_p):
+                    cand = dst_p + name[len(src_p) :]
+                    if cand in model_dict:
+                        name = cand
+                        break
         if name in model_dict and model_dict[name].shape == v.shape:
             filtered_state_dict[name] = v
 
-    model.load_state_dict(filtered_state_dict, strict=False)
+    target_model.load_state_dict(filtered_state_dict, strict=False)
     if verbose:
         print(
             f"===> Loaded {len(filtered_state_dict)}/{len(model_dict)} weight tensors from '{ckpt_path}'"
