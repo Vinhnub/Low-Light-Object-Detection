@@ -46,7 +46,5 @@ head:
   - [-1, 2, C3k2, [1024, True]] # 22 (P5/32-large)
 
   - [16, 1, EdgeSAB, [4, False, 2]] # 23 (P3/8-small EdgeSAB self-attn)
-  - [19, 1, EdgeSAB, [4, False, 2]] # 24 (P4/16-medium EdgeSAB self-attn)
-  - [22, 1, EdgeSAB, [4, False, 2]] # 25 (P5/32-large EdgeSAB self-attn)
 
-  - [[23, 24, 25], 1, Detect, [nc]] # 26 Detect(P3, P4, P5)
+  - [[23, 19, 22], 1, Detect, [nc]] # 24 Detect(P3, P4, P5)

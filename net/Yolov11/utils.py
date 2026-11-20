@@ -288,7 +288,7 @@ def load_yolov11_checkpoint(
                 else m_obj
             )
 
-    # Bidirectional mapping across 24-layer official, 27-layer EdgeSAB, and modular YOLOv11 models
+    # Bidirectional mapping across 24-layer official, 25-layer P3 EdgeSAB, 27-layer EdgeSAB, and modular YOLOv11 models
     base_seq_to_mod = {
         "model.0.": "backbone.stem.",
         "model.1.": "backbone.stage1.0.",
@@ -309,6 +309,11 @@ def load_yolov11_checkpoint(
         "model.22.": "neck.c3k2_n5.",
     }
     seq24_to_mod = {**base_seq_to_mod, "model.23.": "head."}
+    seq25_to_mod = {
+        **base_seq_to_mod,
+        "model.23.": "neck.attn_p3.",
+        "model.24.": "head.",
+    }
     seq27_to_mod = {
         **base_seq_to_mod,
         "model.23.": "neck.attn_p3.",
@@ -316,28 +321,47 @@ def load_yolov11_checkpoint(
         "model.25.": "neck.attn_p5.",
         "model.26.": "head.",
     }
+    seq24_to_seq25 = {"model.23.": "model.24."}
+    seq27_to_seq25 = {"model.26.": "model.24."}
     seq24_to_seq27 = {"model.23.": "model.26."}
+    seq25_to_seq27 = {"model.24.": "model.26."}
+    mod_to_seq25 = {v: k for k, v in seq25_to_mod.items()}
     mod_to_seq27 = {v: k for k, v in seq27_to_mod.items()}
 
     clean_keys = [k[7:] if k.startswith("module.") else k for k in raw_state_dict.keys()]
     src_is_27 = any(k.startswith("model.26.") for k in clean_keys)
+    src_is_25 = any(k.startswith("model.24.cv") or k.startswith("model.24.dfl") for k in clean_keys) and not src_is_27
     src_is_mod = any(k.startswith("backbone.") for k in clean_keys)
-    src_is_24 = any(k.startswith("model.23.cv") or k.startswith("model.23.dfl") for k in clean_keys) and not src_is_27
+    src_is_24 = any(k.startswith("model.23.cv") or k.startswith("model.23.dfl") for k in clean_keys) and not src_is_25 and not src_is_27
 
     target_model = de_parallel(model)
     model_dict = target_model.state_dict()
     dst_is_27 = any(k.startswith("model.26.") for k in model_dict)
+    dst_is_25 = any(k.startswith("model.24.cv") or k.startswith("model.24.dfl") for k in model_dict) and not dst_is_27
     dst_is_mod = any(k.startswith("backbone.") for k in model_dict)
 
     prefix_map: Dict[str, str] = {}
-    if dst_is_mod and src_is_24:
-        prefix_map = seq24_to_mod
-    elif dst_is_mod and src_is_27:
-        prefix_map = seq27_to_mod
-    elif dst_is_27 and src_is_24:
-        prefix_map = seq24_to_seq27
-    elif dst_is_27 and src_is_mod:
-        prefix_map = mod_to_seq27
+    if dst_is_mod:
+        if src_is_24:
+            prefix_map = seq24_to_mod
+        elif src_is_25:
+            prefix_map = seq25_to_mod
+        elif src_is_27:
+            prefix_map = seq27_to_mod
+    elif dst_is_25:
+        if src_is_24:
+            prefix_map = seq24_to_seq25
+        elif src_is_27:
+            prefix_map = seq27_to_seq25
+        elif src_is_mod:
+            prefix_map = mod_to_seq25
+    elif dst_is_27:
+        if src_is_24:
+            prefix_map = seq24_to_seq27
+        elif src_is_25:
+            prefix_map = seq25_to_seq27
+        elif src_is_mod:
+            prefix_map = mod_to_seq27
 
     filtered_state_dict = {}
     for k, v in raw_state_dict.items():

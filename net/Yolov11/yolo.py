@@ -123,9 +123,7 @@ def get_yolov11_cfg_dict(
             [[-1, 10], 1, "Concat", [1]],                  # 21 cat head P5
             [-1, 2, "C3k2", [1024, True]],                 # 22 (P5/32-large)
             [16, 1, "EdgeSAB", [4, False, 2]],             # 23 (P3/8-small EdgeSAB self-attn)
-            [19, 1, "EdgeSAB", [4, False, 2]],             # 24 (P4/16-medium EdgeSAB self-attn)
-            [22, 1, "EdgeSAB", [4, False, 2]],             # 25 (P5/32-large EdgeSAB self-attn)
-            [[23, 24, 25], 1, "Detect", ["nc"]],           # 26 Detect(P3, P4, P5)
+            [[23, 19, 22], 1, "Detect", ["nc"]],           # 24 Detect(P3, P4, P5)
         ],
     }
 
@@ -1104,10 +1102,8 @@ class YOLOv11Neck(nn.Module):
         self.down_p4 = Conv(c4_out, c4_out, k=3, s=2)  # Layer 20
         self.c3k2_n5 = C3k2(c4_out + c5, c5_out, n=d(2), c3k=True)  # Layer 22 (N5/32)
 
-        # Pre-Head Edge-Guided Self-Attention refinement
+        # Pre-Head Edge-Guided Self-Attention refinement (P3/8 only)
         self.attn_p3 = EdgeSAB(c3_out, num_heads=num_heads, bias=False, reduction=2)  # Layer 23
-        self.attn_p4 = EdgeSAB(c4_out, num_heads=num_heads, bias=False, reduction=2)  # Layer 24
-        self.attn_p5 = EdgeSAB(c5_out, num_heads=num_heads, bias=False, reduction=2)  # Layer 25
 
     def forward(
         self,
@@ -1124,10 +1120,8 @@ class YOLOv11Neck(nn.Module):
         n4 = self.c3k2_n4(torch.cat([self.down_p3(n3), f_p4], dim=1))
         n5 = self.c3k2_n5(torch.cat([self.down_p4(n4), p5], dim=1))
 
-        # Pre-Head EdgeSAB Self-Attention
+        # Pre-Head EdgeSAB Self-Attention on P3/8
         n3 = self.attn_p3(n3, edge_map=edge_map)
-        n4 = self.attn_p4(n4, edge_map=edge_map)
-        n5 = self.attn_p5(n5, edge_map=edge_map)
 
         return [n3, n4, n5]
 

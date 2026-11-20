@@ -792,8 +792,8 @@ class EdgeExtractor(nn.Module):
         )
 
         self.channel_fusion = nn.Conv2d(3, 1, kernel_size=1, bias=False)
-        self.scale = nn.Parameter(torch.tensor(10.0))
-        self.offset = nn.Parameter(torch.tensor(-5.0))
+        self.scale = nn.Parameter(torch.tensor(4.0))
+        self.offset = nn.Parameter(torch.tensor(-1.5))
         if self.weber_log:
             self.weber_alpha = nn.Parameter(torch.tensor(0.7))
 
@@ -899,7 +899,7 @@ class EdgeSAB(nn.Module):
         self.num_heads = num_heads
         self.head_dim = inner_dim // num_heads
         self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
-        self.gamma = nn.Parameter(torch.full((1, dim, 1, 1), 0.0))
+        self.gamma = nn.Parameter(torch.full((1, dim, 1, 1), 0.1))
         self.edge_scale = nn.Parameter(torch.tensor(1.0))
 
         self.q = nn.Conv2d(dim, inner_dim, kernel_size=1, bias=bias)
