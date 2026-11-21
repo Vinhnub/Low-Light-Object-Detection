@@ -288,8 +288,8 @@ def load_yolov11_checkpoint(
                 else m_obj
             )
 
-    # Bidirectional mapping across 24-layer official, 25-layer P3 EdgeSAB, 27-layer EdgeSAB, and modular YOLOv11 models
-    base_seq_to_mod = {
+    # Bidirectional mapping across 24L Base, 25L P3-Inline, 25L P3-PreHead, 27L Full EdgeSAB, and modular YOLOv11
+    backbone_fpn_to_mod = {
         "model.0.": "backbone.stem.",
         "model.1.": "backbone.stage1.0.",
         "model.2.": "backbone.stage1.1.",
@@ -303,13 +303,25 @@ def load_yolov11_checkpoint(
         "model.10.": "backbone.stage4.3.",
         "model.13.": "neck.c3k2_p4.",
         "model.16.": "neck.c3k2_p3.",
+    }
+    base_seq_to_mod = {
+        **backbone_fpn_to_mod,
         "model.17.": "neck.down_p3.",
         "model.19.": "neck.c3k2_n4.",
         "model.20.": "neck.down_p4.",
         "model.22.": "neck.c3k2_n5.",
     }
     seq24_to_mod = {**base_seq_to_mod, "model.23.": "head."}
-    seq25_to_mod = {
+    seq25_inline_to_mod = {
+        **backbone_fpn_to_mod,
+        "model.17.": "neck.attn_p3.",
+        "model.18.": "neck.down_p3.",
+        "model.20.": "neck.c3k2_n4.",
+        "model.21.": "neck.down_p4.",
+        "model.23.": "neck.c3k2_n5.",
+        "model.24.": "head.",
+    }
+    seq25_prehead_to_mod = {
         **base_seq_to_mod,
         "model.23.": "neck.attn_p3.",
         "model.24.": "head.",
@@ -321,45 +333,96 @@ def load_yolov11_checkpoint(
         "model.25.": "neck.attn_p5.",
         "model.26.": "head.",
     }
-    seq24_to_seq25 = {"model.23.": "model.24."}
-    seq27_to_seq25 = {"model.26.": "model.24."}
+    pan_shift_plus1 = {
+        "model.17.": "model.18.",
+        "model.19.": "model.20.",
+        "model.20.": "model.21.",
+        "model.22.": "model.23.",
+    }
+    seq24_to_seq25_inline = {**pan_shift_plus1, "model.23.": "model.24."}
+    seq25_prehead_to_seq25_inline = {**pan_shift_plus1, "model.23.": "model.17."}
+    seq27_to_seq25_inline = {**pan_shift_plus1, "model.23.": "model.17.", "model.26.": "model.24."}
+    seq24_to_seq25_prehead = {"model.23.": "model.24."}
+    seq25_inline_to_seq25_prehead = {
+        "model.17.": "model.23.",
+        "model.18.": "model.17.",
+        "model.20.": "model.19.",
+        "model.21.": "model.20.",
+        "model.23.": "model.22.",
+    }
+    seq27_to_seq25_prehead = {"model.26.": "model.24."}
     seq24_to_seq27 = {"model.23.": "model.26."}
-    seq25_to_seq27 = {"model.24.": "model.26."}
-    mod_to_seq25 = {v: k for k, v in seq25_to_mod.items()}
+    seq25_prehead_to_seq27 = {"model.24.": "model.26."}
+    seq25_inline_to_seq27 = {
+        "model.17.": "model.23.",
+        "model.18.": "model.17.",
+        "model.20.": "model.19.",
+        "model.21.": "model.20.",
+        "model.23.": "model.22.",
+        "model.24.": "model.26.",
+    }
+    mod_to_seq25_inline = {v: k for k, v in seq25_inline_to_mod.items()}
+    mod_to_seq25_prehead = {v: k for k, v in seq25_prehead_to_mod.items()}
     mod_to_seq27 = {v: k for k, v in seq27_to_mod.items()}
+
+    def _has_edgesab_at(keys: List[str], idx: int) -> bool:
+        p = f"model.{idx}."
+        return any(k.startswith((f"{p}q.", f"{p}gamma", f"{p}edge_gate.")) for k in keys)
+
+    def _has_detect_at(keys: List[str], idx: int) -> bool:
+        p = f"model.{idx}."
+        return any(k.startswith((f"{p}cv", f"{p}dfl")) for k in keys)
 
     clean_keys = [k[7:] if k.startswith("module.") else k for k in raw_state_dict.keys()]
     src_is_27 = any(k.startswith("model.26.") for k in clean_keys)
-    src_is_25 = any(k.startswith("model.24.cv") or k.startswith("model.24.dfl") for k in clean_keys) and not src_is_27
+    src_is_25_inline = _has_edgesab_at(clean_keys, 17) and _has_detect_at(clean_keys, 24) and not src_is_27
+    src_is_25_prehead = _has_edgesab_at(clean_keys, 23) and _has_detect_at(clean_keys, 24) and not src_is_27
     src_is_mod = any(k.startswith("backbone.") for k in clean_keys)
-    src_is_24 = any(k.startswith("model.23.cv") or k.startswith("model.23.dfl") for k in clean_keys) and not src_is_25 and not src_is_27
+    src_is_24 = _has_detect_at(clean_keys, 23) and not src_is_25_inline and not src_is_25_prehead and not src_is_27
 
     target_model = de_parallel(model)
     model_dict = target_model.state_dict()
-    dst_is_27 = any(k.startswith("model.26.") for k in model_dict)
-    dst_is_25 = any(k.startswith("model.24.cv") or k.startswith("model.24.dfl") for k in model_dict) and not dst_is_27
-    dst_is_mod = any(k.startswith("backbone.") for k in model_dict)
+    dst_keys = list(model_dict.keys())
+    dst_is_27 = any(k.startswith("model.26.") for k in dst_keys)
+    dst_is_25_inline = _has_edgesab_at(dst_keys, 17) and _has_detect_at(dst_keys, 24) and not dst_is_27
+    dst_is_25_prehead = _has_edgesab_at(dst_keys, 23) and _has_detect_at(dst_keys, 24) and not dst_is_27
+    dst_is_mod = any(k.startswith("backbone.") for k in dst_keys)
 
     prefix_map: Dict[str, str] = {}
     if dst_is_mod:
         if src_is_24:
             prefix_map = seq24_to_mod
-        elif src_is_25:
-            prefix_map = seq25_to_mod
+        elif src_is_25_inline:
+            prefix_map = seq25_inline_to_mod
+        elif src_is_25_prehead:
+            prefix_map = seq25_prehead_to_mod
         elif src_is_27:
             prefix_map = seq27_to_mod
-    elif dst_is_25:
+    elif dst_is_25_inline:
         if src_is_24:
-            prefix_map = seq24_to_seq25
+            prefix_map = seq24_to_seq25_inline
+        elif src_is_25_prehead:
+            prefix_map = seq25_prehead_to_seq25_inline
         elif src_is_27:
-            prefix_map = seq27_to_seq25
+            prefix_map = seq27_to_seq25_inline
         elif src_is_mod:
-            prefix_map = mod_to_seq25
+            prefix_map = mod_to_seq25_inline
+    elif dst_is_25_prehead:
+        if src_is_24:
+            prefix_map = seq24_to_seq25_prehead
+        elif src_is_25_inline:
+            prefix_map = seq25_inline_to_seq25_prehead
+        elif src_is_27:
+            prefix_map = seq27_to_seq25_prehead
+        elif src_is_mod:
+            prefix_map = mod_to_seq25_prehead
     elif dst_is_27:
         if src_is_24:
             prefix_map = seq24_to_seq27
-        elif src_is_25:
-            prefix_map = seq25_to_seq27
+        elif src_is_25_inline:
+            prefix_map = seq25_inline_to_seq27
+        elif src_is_25_prehead:
+            prefix_map = seq25_prehead_to_seq27
         elif src_is_mod:
             prefix_map = mod_to_seq27
 
@@ -368,13 +431,11 @@ def load_yolov11_checkpoint(
         name = k[7:] if k.startswith("module.") else k
         if isinstance(v, torch.Tensor) and v.is_floating_point():
             v = v.float()
-        if name not in model_dict and prefix_map:
+        if prefix_map:
             for src_p, dst_p in prefix_map.items():
                 if name.startswith(src_p):
-                    cand = dst_p + name[len(src_p) :]
-                    if cand in model_dict:
-                        name = cand
-                        break
+                    name = dst_p + name[len(src_p) :]
+                    break
         if name in model_dict and model_dict[name].shape == v.shape:
             filtered_state_dict[name] = v
 

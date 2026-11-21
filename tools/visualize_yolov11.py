@@ -100,6 +100,19 @@ YOLOV11_BASE_LAYER_META: Dict[int, Tuple[str, str]] = {
     23: ("Head", "L23_Detect_P3_P4_P5"),
 }
 
+YOLOV11_ENHANCED_P3_INLINE_LAYER_META: Dict[int, Tuple[str, str]] = {
+    **YOLOV11_BASE_LAYER_META,
+    16: ("FPN_Neck", "L16_FPN_C3k2_N3_P3_8"),
+    17: ("EdgeSAB_HeadIn", "L17_EdgeSAB_Inline_N3_P3_8"),
+    18: ("PAN_Neck", "L18_PAN_Down_N3"),
+    19: ("PAN_Neck", "L19_PAN_Concat_P4"),
+    20: ("PAN_HeadIn", "L20_NeckOut_N4_P4_16"),
+    21: ("PAN_Neck", "L21_PAN_Down_N4"),
+    22: ("PAN_Neck", "L22_PAN_Concat_P5"),
+    23: ("PAN_HeadIn", "L23_NeckOut_N5_P5_32"),
+    24: ("Head", "L24_Detect_P3_P4_P5"),
+}
+
 YOLOV11_ENHANCED_P3_LAYER_META: Dict[int, Tuple[str, str]] = {
     **YOLOV11_BASE_LAYER_META,
     16: ("PAN_Neck", "L16_PAN_C3k2_N3_P3_8"),
@@ -201,6 +214,33 @@ def get_yolov11_base_cfg_dict(variant: str = "s", nc: int = 80) -> Dict[str, Any
         "backbone": _yolov11_backbone_cfg(),
         "head": _yolov11_fpn_pan_cfg() + [
             [[16, 19, 22], 1, "Detect", ["nc"]],       # 23 Detect(P3, P4, P5)
+        ],
+    }
+
+
+def get_yolov11_enhanced_p3_inline_cfg_dict(variant: str = "s", nc: int = 80) -> Dict[str, Any]:
+    """Return 25-layer Enhanced YOLOv11 config with inline EdgeSAB on P3/8 feeding Detect P3 & PAN."""
+    v = _parse_variant(variant)
+    return {
+        "nc": nc,
+        "scale": v,
+        "scales": {k: list(vals) for k, vals in YOLOV11_SCALES.items()},
+        "backbone": _yolov11_backbone_cfg(),
+        "head": [
+            [-1, 1, "nn.Upsample", [None, 2, "nearest"]],  # 11
+            [[-1, 6], 1, "Concat", [1]],                   # 12 cat backbone P4
+            [-1, 2, "C3k2", [512, False]],                 # 13
+            [-1, 1, "nn.Upsample", [None, 2, "nearest"]],  # 14
+            [[-1, 4], 1, "Concat", [1]],                   # 15 cat backbone P3
+            [-1, 2, "C3k2", [256, False]],                 # 16 (FPN P3/8-small)
+            [-1, 1, "EdgeSAB", [4, False, 2]],             # 17 (Inline EdgeSAB P3/8)
+            [-1, 1, "Conv", [256, 3, 2]],                  # 18 (PAN Down from EdgeSAB P3)
+            [[-1, 13], 1, "Concat", [1]],                  # 19 cat head P4
+            [-1, 2, "C3k2", [512, False]],                 # 20 (P4/16-medium)
+            [-1, 1, "Conv", [512, 3, 2]],                  # 21 (PAN Down from P4)
+            [[-1, 10], 1, "Concat", [1]],                  # 22 cat head P5
+            [-1, 2, "C3k2", [1024, True]],                 # 23 (P5/32-large)
+            [[17, 20, 23], 1, "Detect", ["nc"]],           # 24 Detect(P3, P4, P5)
         ],
     }
 
@@ -507,17 +547,31 @@ def _detect_ckpt_properties(raw_sd: Dict[str, Any]) -> Tuple[bool, str, str]:
     clean_keys = [k[7:] if k.startswith("module.") else k for k in raw_sd.keys()]
     is_modular = any(k.startswith("backbone.") for k in clean_keys)
     is_27 = any(k.startswith(("model.26.", "neck.attn_p4.")) for k in clean_keys)
-    is_25 = (
-        any(k.startswith(("model.24.cv", "model.24.dfl")) for k in clean_keys)
-        or (any(k.startswith("neck.attn_p3.") for k in clean_keys) and not any(k.startswith("neck.attn_p4.") for k in clean_keys))
-    ) and not is_27
-    is_enhanced = is_27 or is_25 or any(
-        k.startswith(("edge_extractor.", "model.23.q.", "model.23.edge_gate.", "model.23.gamma"))
+    has_det_24 = any(k.startswith(("model.24.cv", "model.24.dfl")) for k in clean_keys)
+    is_25_inline = (
+        has_det_24
+        and any(k.startswith(("model.17.q.", "model.17.gamma", "model.17.edge_gate.")) for k in clean_keys)
+        and not is_27
+    )
+    is_25_prehead = (
+        has_det_24
+        and any(k.startswith(("model.23.q.", "model.23.gamma", "model.23.edge_gate.")) for k in clean_keys)
+        and not is_27
+    )
+    is_mod_p3 = (
+        any(k.startswith("neck.attn_p3.") for k in clean_keys)
+        and not any(k.startswith("neck.attn_p4.") for k in clean_keys)
+        and not is_27
+    )
+    is_enhanced = is_27 or is_25_inline or is_25_prehead or is_mod_p3 or any(
+        k.startswith(("edge_extractor.", "model.17.q.", "model.23.q.", "model.23.edge_gate.", "model.23.gamma"))
         for k in clean_keys
     )
     if is_27:
         enh_mode = "full"
-    elif is_25:
+    elif is_25_inline or is_mod_p3:
+        enh_mode = "p3_inline"
+    elif is_25_prehead:
         enh_mode = "p3"
     elif is_enhanced:
         enh_mode = "full"
@@ -619,19 +673,23 @@ def load_yolov11_model(
                 "Enhanced YOLOv11 (EdgeExtractor + EdgeSAB) is not available on the current branch. "
                 "Please switch to branch 'develop-yolov11' or 'develop-yolov11-p3-edgesab' to visualize Enhanced YOLOv11."
             )
-        if auto_enh_mode in {"p3", "full"}:
+        branch_head = Yolov11.get_yolov11_cfg_dict(variant, nc).get("head", [])
+        branch_is_p3_inline = len(branch_head) == 14 and len(branch_head) > 6 and branch_head[6][2] in {"EdgeSAB", "SAB"}
+        branch_is_p3_prehead = len(branch_head) == 14 and not branch_is_p3_inline
+
+        if auto_enh_mode in {"p3_inline", "p3", "full"}:
             enhanced_mode = auto_enh_mode
         else:
-            branch_head_len = len(Yolov11.get_yolov11_cfg_dict(variant, nc).get("head", []))
-            enhanced_mode = "p3" if branch_head_len == 14 else "full"
+            enhanced_mode = "p3_inline" if branch_is_p3_inline else ("p3" if branch_is_p3_prehead else "full")
 
-        branch_is_p3 = len(Yolov11.get_yolov11_cfg_dict(variant, nc).get("head", [])) == 14
         if cfg_path:
             model = DetectionModel(cfg=cfg_path, ch=3, nc=nc)
-            n_sab = sum(1 for m in model.model if type(m).__name__ in {"EdgeSAB", "SAB"})
-            enhanced_mode = "p3" if n_sab == 1 else ("full" if n_sab >= 2 else "none")
-        elif is_modular and ((enhanced_mode == "p3") == branch_is_p3):
+            sab_idxs = [i for i, m in enumerate(model.model) if type(m).__name__ in {"EdgeSAB", "SAB"}]
+            enhanced_mode = "p3_inline" if sab_idxs == [17] else ("p3" if len(sab_idxs) == 1 else ("full" if len(sab_idxs) >= 2 else "none"))
+        elif is_modular and ((enhanced_mode in {"p3_inline", "p3"}) == (branch_is_p3_inline or branch_is_p3_prehead)):
             model = Yolov11.YOLOv11(num_classes=nc, variant=variant, in_channels=3)
+        elif enhanced_mode == "p3_inline":
+            model = DetectionModel(cfg=get_yolov11_enhanced_p3_inline_cfg_dict(variant, nc), ch=3, nc=nc)
         elif enhanced_mode == "p3":
             model = DetectionModel(cfg=get_yolov11_enhanced_p3_cfg_dict(variant, nc), ch=3, nc=nc)
         else:
@@ -669,7 +727,7 @@ def load_yolov11_model(
     num_layers = (
         len(model.model)
         if hasattr(model, "model")
-        else (25 if enhanced_mode == "p3" else (27 if arch == "enhanced" else 24))
+        else (25 if enhanced_mode in {"p3_inline", "p3"} else (27 if arch == "enhanced" else 24))
     )
     meta_info = {
         "epoch": ckpt_meta.get("epoch", "?") if isinstance(ckpt_meta, dict) else "?",
@@ -858,10 +916,12 @@ class YOLOv11FeatureRecorder:
             )
 
         if hasattr(self.model, "model") and isinstance(self.model.model, nn.Sequential):
-            n_edgesab = sum(1 for m in self.model.model if type(m).__name__ in {"EdgeSAB", "SAB"})
-            if n_edgesab == 1:
+            sab_idxs = [i for i, m in enumerate(self.model.model) if type(m).__name__ in {"EdgeSAB", "SAB"}]
+            if sab_idxs == [17]:
+                meta_table = YOLOV11_ENHANCED_P3_INLINE_LAYER_META
+            elif len(sab_idxs) == 1:
                 meta_table = YOLOV11_ENHANCED_P3_LAYER_META
-            elif n_edgesab >= 2:
+            elif len(sab_idxs) >= 2:
                 meta_table = YOLOV11_ENHANCED_LAYER_META
             else:
                 meta_table = YOLOV11_BASE_LAYER_META
@@ -918,20 +978,32 @@ class YOLOv11FeatureRecorder:
                 has_p3_attn = hasattr(nk, "attn_p3")
                 has_p4_attn = hasattr(nk, "attn_p4")
                 has_p5_attn = hasattr(nk, "attn_p5")
-                modular_points.extend([
-                    ("FPN_Neck", "L13_FPN_C3k2_P4", 13, nk.c3k2_p4),
-                    ("PAN_Neck" if has_p3_attn else "PAN_HeadIn", "L16_PAN_C3k2_N3_P3_8", 16, nk.c3k2_p3),
-                    ("PAN_Neck", "L17_PAN_Down_N3", 17, nk.down_p3),
-                    ("PAN_Neck" if has_p4_attn else "PAN_HeadIn", "L19_PAN_C3k2_N4_P4_16", 19, nk.c3k2_n4),
-                    ("PAN_Neck", "L20_PAN_Down_N4", 20, nk.down_p4),
-                    ("PAN_Neck" if has_p5_attn else "PAN_HeadIn", "L22_PAN_C3k2_N5_P5_32", 22, nk.c3k2_n5),
-                ])
-                if has_p3_attn:
-                    modular_points.append(("EdgeSAB_HeadIn", "L23_EdgeSAB_N3_P3_8", 23, nk.attn_p3))
-                if has_p4_attn:
-                    modular_points.append(("EdgeSAB_HeadIn", "L24_EdgeSAB_N4_P4_16", 24, nk.attn_p4))
-                if has_p5_attn:
-                    modular_points.append(("EdgeSAB_HeadIn", "L25_EdgeSAB_N5_P5_32", 25, nk.attn_p5))
+                is_p3_inline_mod = has_p3_attn and not has_p4_attn and not has_p5_attn
+                if is_p3_inline_mod:
+                    modular_points.extend([
+                        ("FPN_Neck", "L13_FPN_C3k2_P4", 13, nk.c3k2_p4),
+                        ("FPN_Neck", "L16_FPN_C3k2_N3_P3_8", 16, nk.c3k2_p3),
+                        ("EdgeSAB_HeadIn", "L17_EdgeSAB_Inline_N3_P3_8", 17, nk.attn_p3),
+                        ("PAN_Neck", "L18_PAN_Down_N3", 18, nk.down_p3),
+                        ("PAN_HeadIn", "L20_NeckOut_N4_P4_16", 20, nk.c3k2_n4),
+                        ("PAN_Neck", "L21_PAN_Down_N4", 21, nk.down_p4),
+                        ("PAN_HeadIn", "L23_NeckOut_N5_P5_32", 23, nk.c3k2_n5),
+                    ])
+                else:
+                    modular_points.extend([
+                        ("FPN_Neck", "L13_FPN_C3k2_P4", 13, nk.c3k2_p4),
+                        ("PAN_Neck" if has_p3_attn else "PAN_HeadIn", "L16_PAN_C3k2_N3_P3_8", 16, nk.c3k2_p3),
+                        ("PAN_Neck", "L17_PAN_Down_N3", 17, nk.down_p3),
+                        ("PAN_Neck" if has_p4_attn else "PAN_HeadIn", "L19_PAN_C3k2_N4_P4_16", 19, nk.c3k2_n4),
+                        ("PAN_Neck", "L20_PAN_Down_N4", 20, nk.down_p4),
+                        ("PAN_Neck" if has_p5_attn else "PAN_HeadIn", "L22_PAN_C3k2_N5_P5_32", 22, nk.c3k2_n5),
+                    ])
+                    if has_p3_attn:
+                        modular_points.append(("EdgeSAB_HeadIn", "L23_EdgeSAB_N3_P3_8", 23, nk.attn_p3))
+                    if has_p4_attn:
+                        modular_points.append(("EdgeSAB_HeadIn", "L24_EdgeSAB_N4_P4_16", 24, nk.attn_p4))
+                    if has_p5_attn:
+                        modular_points.append(("EdgeSAB_HeadIn", "L25_EdgeSAB_N5_P5_32", 25, nk.attn_p5))
             if hasattr(self.model, "head"):
                 det_idx = 26 if (has_p4_attn or has_p5_attn) else (24 if has_p3_attn else 23)
                 modular_points.append(("Head", f"L{det_idx:02d}_Detect_P3_P4_P5", det_idx, self.model.head))
@@ -1586,11 +1658,16 @@ def save_network_overview(
     arch = meta_info["arch"]
     epoch = meta_info["epoch"]
     sab_indices = _get_edgesab_indices(records)
+    is_p3_inline = arch == "enhanced" and sab_indices == {17}
     is_p3_only = arch == "enhanced" and sab_indices == {23}
     arch_tag = (
-        "Enhanced YOLOv11 (Edge+EdgeSAB-P3)"
-        if is_p3_only
-        else ("Enhanced YOLOv11 (Edge+EdgeSAB)" if arch == "enhanced" else "YOLOv11 Base")
+        "Enhanced YOLOv11 (Edge+InlineEdgeSAB-P3)"
+        if is_p3_inline
+        else (
+            "Enhanced YOLOv11 (Edge+EdgeSAB-P3)"
+            if is_p3_only
+            else ("Enhanced YOLOv11 (Edge+EdgeSAB)" if arch == "enhanced" else "YOLOv11 Base")
+        )
     )
 
     tiles: List[np.ndarray] = [
@@ -1618,7 +1695,9 @@ def save_network_overview(
         )
 
     if arch == "enhanced":
-        if is_p3_only:
+        if is_p3_inline:
+            key_indices = {-1, 0, 2, 4, 6, 9, 10, 13, 17, 20, 23} if gt_bgr is not None else {-1, 0, 2, 4, 6, 8, 9, 10, 13, 17, 20, 23}
+        elif is_p3_only:
             key_indices = {-1, 0, 2, 4, 6, 9, 10, 13, 19, 22, 23} if gt_bgr is not None else {-1, 0, 2, 4, 6, 8, 9, 10, 13, 19, 22, 23}
         else:
             # Pick 10 (with GT) or 11 (no GT) feature layers + EdgeExtractor + 3 Detect maps = 16 tiles (4x4)
@@ -1703,11 +1782,19 @@ def save_backbone_vs_neck_scales(
 
     is_enh = arch == "enhanced"
     sab_indices = _get_edgesab_indices(records)
-    scale_rows = [
-        ("P3/8 (Small)", 4, 16, 23 if 23 in sab_indices else None, 0),
-        ("P4/16 (Medium)", 6, 19, 24 if 24 in sab_indices else None, 1),
-        ("P5/32 (Large)", 10, 22, 25 if 25 in sab_indices else None, 2),
-    ]
+    is_p3_inline = is_enh and sab_indices == {17}
+    if is_p3_inline:
+        scale_rows = [
+            ("P3/8 (Small)", 4, 16, 17, 0),
+            ("P4/16 (Medium)", 6, 20, None, 1),
+            ("P5/32 (Large)", 10, 23, None, 2),
+        ]
+    else:
+        scale_rows = [
+            ("P3/8 (Small)", 4, 16, 23 if 23 in sab_indices else None, 0),
+            ("P4/16 (Medium)", 6, 19, 24 if 24 in sab_indices else None, 1),
+            ("P5/32 (Large)", 10, 22, 25 if 25 in sab_indices else None, 2),
+        ]
 
     tiles: List[np.ndarray] = []
     for scale_label, bb_idx, pan_idx, sab_idx, det_idx in scale_rows:
@@ -2060,8 +2147,8 @@ def save_edgesab_attention_details(
     th, tw = base_tile.shape[:2]
 
     by_idx = {r["layer_idx"]: r for r in records.values() if not r["is_sublayer"] and "tensor" in r}
-    pre_idx_map = {23: 16, 24: 19, 25: 22}
-    scale_names = {23: "P3/8 (L23)", 24: "P4/16 (L24)", 25: "P5/32 (L25)"}
+    pre_idx_map = {17: 16, 23: 16, 24: 19, 25: 22}
+    scale_names = {17: "P3/8 Inline (L17)", 23: "P3/8 (L23)", 24: "P4/16 (L24)", 25: "P5/32 (L25)"}
 
     tiles: List[np.ndarray] = []
     for label, tr in edgesab_traces.items():
@@ -2238,6 +2325,8 @@ def save_compare_predictions_and_edge(
     if gt_bgr is not None:
         tiles.append(make_labeled_tile(resize_to_panel(gt_bgr, pw), "Ground Truth", "Dataset annotation", accent_bgr=(80, 220, 255)))
 
+    enh_mode = enh_res["meta"].get("enhanced_mode", "full")
+    enh_suffix = "-P3-Inline" if enh_mode == "p3_inline" else ("-P3" if enh_mode == "p3" else "")
     tiles.extend([
         make_labeled_tile(
             resize_to_panel(base_res["pred_bgr"], pw),
@@ -2248,7 +2337,7 @@ def save_compare_predictions_and_edge(
         make_labeled_tile(
             resize_to_panel(enh_res["pred_bgr"], pw),
             f"Enhanced YOLOv11 Preds ({enh_res['n_preds']})",
-            f"{enh_res['model_name']} (ep={enh_res['meta']['epoch']}, {enh_res['meta']['num_layers']}L+EdgeSAB{'-P3' if enh_res['meta'].get('enhanced_mode') == 'p3' else ''})",
+            f"{enh_res['model_name']} (ep={enh_res['meta']['epoch']}, {enh_res['meta']['num_layers']}L+EdgeSAB{enh_suffix})",
             accent_bgr=(80, 230, 140),
         ),
     ])
@@ -2295,18 +2384,27 @@ def save_compare_multiscale_features(
     enh_by_idx = {r["layer_idx"]: r for r in enh_res["records"].values() if not r["is_sublayer"] and "tensor" in r}
     enh_edge_by_idx = {tr["layer_idx"]: tr for tr in enh_res["edgesab_traces"].values()}
 
-    scale_rows = [
-        ("P3/8 (Small)", 16, 23),
-        ("P4/16 (Medium)", 19, 24),
-        ("P5/32 (Large)", 22, 25),
-    ]
+    enh_mode = enh_res["meta"].get("enhanced_mode", "full")
+    if enh_mode == "p3_inline":
+        # (scale_label, base_pan_idx, enh_pre_idx, enh_post_idx_or_None)
+        scale_rows = [
+            ("P3/8 (Small)", 16, 16, 17),
+            ("P4/16 (Medium)", 19, 20, None),
+            ("P5/32 (Large)", 22, 23, None),
+        ]
+    else:
+        scale_rows = [
+            ("P3/8 (Small)", 16, 16, 23),
+            ("P4/16 (Medium)", 19, 19, 24),
+            ("P5/32 (Large)", 22, 22, 25),
+        ]
 
     tiles: List[np.ndarray] = []
-    for s_label, pan_idx, sab_idx in scale_rows:
-        b_map = feature_to_spatial_maps(base_by_idx[pan_idx]["tensor"])["l2"]
-        e_pre_t = enh_by_idx[pan_idx]["tensor"]
+    for s_label, base_pan_idx, enh_pan_idx, sab_idx in scale_rows:
+        b_map = feature_to_spatial_maps(base_by_idx[base_pan_idx]["tensor"])["l2"]
+        e_pre_t = enh_by_idx[enh_pan_idx]["tensor"]
         e_pre_map = feature_to_spatial_maps(e_pre_t)["l2"]
-        has_sab = sab_idx in enh_by_idx
+        has_sab = sab_idx is not None and sab_idx in enh_by_idx
         e_post_map = feature_to_spatial_maps(enh_by_idx[sab_idx]["tensor"])["l2"] if has_sab else e_pre_map
         diff_map = e_post_map - b_map
 
@@ -2322,7 +2420,7 @@ def save_compare_multiscale_features(
         eo_ov, _ = render_heatmap_overlay(base_tile, e_post_map, imgsz, crop_box, cmap_id, alpha=args.alpha, fixed_range=(0.0, vmax))
         diff_ov, _, diff_vmax = render_signed_diff_map(base_tile, diff_map, imgsz, crop_box)
 
-        tr = enh_edge_by_idx.get(sab_idx)
+        tr = enh_edge_by_idx.get(sab_idx) if sab_idx is not None else None
         if tr is not None:
             e_scaled = tr["maps"]["edge_scaled"]
         elif enh_res.get("edge_trace") is not None:
@@ -2337,11 +2435,11 @@ def save_compare_multiscale_features(
 
         b_l2 = float(np.sqrt((b_map ** 2).mean()))
         e_l2 = float(np.sqrt((e_post_map ** 2).mean()))
-        post_title = f"{s_label} Enh EdgeSAB (L{sab_idx:02d})" if has_sab else f"{s_label} Enh Neck Out (L{pan_idx:02d})"
-        post_sub = f"L2={e_l2:.3f}" if has_sab else f"L2={e_l2:.3f} | No EdgeSAB"
+        post_title = f"{s_label} Enh EdgeSAB (L{sab_idx:02d})" if has_sab else f"{s_label} Enh PAN Out (L{enh_pan_idx:02d})"
+        post_sub = f"L2={e_l2:.3f}" if has_sab else (f"L2={e_l2:.3f} | Enriched via P3" if enh_mode == "p3_inline" else f"L2={e_l2:.3f} | No EdgeSAB")
         tiles.extend([
-            make_labeled_tile(b_ov, f"{s_label} Base Neck (L{pan_idx:02d})", f"L2={b_l2:.3f} | shared scale", accent_bgr=(50, 170, 255)),
-            make_labeled_tile(ep_ov, f"{s_label} Enh Pre-Attn (L{pan_idx:02d})" if has_sab else f"{s_label} Enh PAN (L{pan_idx:02d})", f"L2={np.sqrt((e_pre_map**2).mean()):.3f}", accent_bgr=(230, 210, 80)),
+            make_labeled_tile(b_ov, f"{s_label} Base Neck (L{base_pan_idx:02d})", f"L2={b_l2:.3f} | shared scale", accent_bgr=(50, 170, 255)),
+            make_labeled_tile(ep_ov, f"{s_label} Enh Pre-Attn (L{enh_pan_idx:02d})" if has_sab else f"{s_label} Enh PAN (L{enh_pan_idx:02d})", f"L2={np.sqrt((e_pre_map**2).mean()):.3f}", accent_bgr=(230, 210, 80)),
             make_labeled_tile(eo_ov, post_title, post_sub, accent_bgr=(255, 80, 220) if has_sab else (80, 230, 140)),
             make_labeled_tile(diff_ov, f"{s_label} Delta (Enh - Base)", f"mean={diff_map.mean():+.3f} | +-={diff_vmax:.2f}", accent_bgr=(80, 230, 140)),
             make_labeled_tile(es_ov, f"{s_label} Scaled Edge Map", f"mean={e_scaled.mean():.3f} | max={e_scaled.max():.2f}", accent_bgr=(60, 220, 255)),
@@ -2453,10 +2551,13 @@ def save_compare_activation_stats(
 
         ax1.plot(x, b_l2, marker="o", linewidth=2.0, color="#56b4ff", label="YOLOv11 Base L2 Energy")
         ax1.plot(x, e_l2, marker="s", linewidth=2.0, color="#ff5cc8", label="Enhanced YOLOv11 L2 Energy")
-        sab_positions = [pos for pos, r in enumerate(e_recs) if r.get("mod_type") in {"EdgeSAB", "SAB"}]
+        sab_idx_set = {r["layer_idx"] for r in e_recs if r.get("mod_type") in {"EdgeSAB", "SAB"}}
+        sab_positions = [pos for pos, idx_val in enumerate(all_idx) if idx_val in sab_idx_set]
         if sab_positions:
             s_lo, s_hi = min(sab_positions), max(sab_positions)
-            sab_lbl = f"Pre-Head EdgeSAB (L{e_recs[s_lo]['layer_idx']}" + (f"-L{e_recs[s_hi]['layer_idx']})" if s_hi > s_lo else ")")
+            l_lo, l_hi = all_idx[s_lo], all_idx[s_hi]
+            sab_prefix = "Inline EdgeSAB" if sab_idx_set == {17} else "Pre-Head EdgeSAB"
+            sab_lbl = f"{sab_prefix} (L{l_lo}" + (f"-L{l_hi})" if l_hi > l_lo else ")")
             ax1.axvspan(s_lo - 0.5, s_hi + 0.5, color="#ff5cc8", alpha=0.08, label=sab_lbl)
         ax1.set_ylabel("L2 Energy", color="#d8dce6", fontsize=9)
         ax1.set_title(f"Base vs Enhanced YOLOv11 Layer & Head Quantitative Comparison ({img_name})", color="#f0f4ff", fontsize=11, pad=10)
@@ -2747,7 +2848,9 @@ def main() -> None:
 
         print("Mode       : Comparison (YOLOv11 Base vs Enhanced YOLOv11)")
         print(f"Base       : {args.base_weights} ({base_name}, ep={base_meta['epoch']}, {base_meta['num_layers']}L, nc={base_nc})")
-        enh_tag = f"{enh_meta['num_layers']}L+EdgeSAB{'-P3' if enh_meta.get('enhanced_mode') == 'p3' else ''}"
+        enh_mode = enh_meta.get("enhanced_mode", "full")
+        enh_suffix = "-P3-Inline" if enh_mode == "p3_inline" else ("-P3" if enh_mode == "p3" else "")
+        enh_tag = f"{enh_meta['num_layers']}L+EdgeSAB{enh_suffix}"
         print(f"Enhanced   : {args.enhanced_weights} ({enh_name}, ep={enh_meta['epoch']}, {enh_tag}, nc={enh_nc})")
         print(f"Device     : {device}")
         print(f"Images     : {len(img_paths)} file(s)")

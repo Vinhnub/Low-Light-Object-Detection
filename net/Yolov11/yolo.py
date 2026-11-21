@@ -115,15 +115,15 @@ def get_yolov11_cfg_dict(
             [-1, 2, "C3k2", [512, False]],                 # 13
             [-1, 1, "nn.Upsample", [None, 2, "nearest"]],  # 14
             [[-1, 4], 1, "Concat", [1]],                   # 15 cat backbone P3
-            [-1, 2, "C3k2", [256, False]],                 # 16 (P3/8-small)
-            [-1, 1, "Conv", [256, 3, 2]],                  # 17
-            [[-1, 13], 1, "Concat", [1]],                  # 18 cat head P4
-            [-1, 2, "C3k2", [512, False]],                 # 19 (P4/16-medium)
-            [-1, 1, "Conv", [512, 3, 2]],                  # 20
-            [[-1, 10], 1, "Concat", [1]],                  # 21 cat head P5
-            [-1, 2, "C3k2", [1024, True]],                 # 22 (P5/32-large)
-            [16, 1, "EdgeSAB", [4, False, 2]],             # 23 (P3/8-small EdgeSAB self-attn)
-            [[23, 19, 22], 1, "Detect", ["nc"]],           # 24 Detect(P3, P4, P5)
+            [-1, 2, "C3k2", [256, False]],                 # 16 (FPN P3/8-small)
+            [-1, 1, "EdgeSAB", [4, False, 2]],             # 17 (P3/8-small Inline EdgeSAB -> Detect P3 & PAN)
+            [-1, 1, "Conv", [256, 3, 2]],                  # 18 (PAN Down from EdgeSAB P3)
+            [[-1, 13], 1, "Concat", [1]],                  # 19 cat head P4
+            [-1, 2, "C3k2", [512, False]],                 # 20 (P4/16-medium)
+            [-1, 1, "Conv", [512, 3, 2]],                  # 21 (PAN Down from P4)
+            [[-1, 10], 1, "Concat", [1]],                  # 22 cat head P5
+            [-1, 2, "C3k2", [1024, True]],                 # 23 (P5/32-large)
+            [[17, 20, 23], 1, "Detect", ["nc"]],           # 24 Detect(P3, P4, P5)
         ],
     }
 
@@ -1095,15 +1095,15 @@ class YOLOv11Neck(nn.Module):
         self.upsample2 = nn.Upsample(scale_factor=2, mode="nearest")  # Layer 14
         self.c3k2_p3 = C3k2(c4_fpn + c3, c3_out, n=d(2), c3k=c3k_override)  # Layer 16 (N3/8)
 
+        # Inline Edge-Guided Self-Attention refinement (P3/8 -> feeds both Detect P3 and PAN)
+        self.attn_p3 = EdgeSAB(c3_out, num_heads=num_heads, bias=False, reduction=2)  # Layer 17
+
         # Bottom-up PAN pathway
-        self.down_p3 = Conv(c3_out, c3_out, k=3, s=2)  # Layer 17
-        self.c3k2_n4 = C3k2(c3_out + c4_fpn, c4_out, n=d(2), c3k=c3k_override)  # Layer 19 (N4/16)
+        self.down_p3 = Conv(c3_out, c3_out, k=3, s=2)  # Layer 18
+        self.c3k2_n4 = C3k2(c3_out + c4_fpn, c4_out, n=d(2), c3k=c3k_override)  # Layer 20 (N4/16)
 
-        self.down_p4 = Conv(c4_out, c4_out, k=3, s=2)  # Layer 20
-        self.c3k2_n5 = C3k2(c4_out + c5, c5_out, n=d(2), c3k=True)  # Layer 22 (N5/32)
-
-        # Pre-Head Edge-Guided Self-Attention refinement (P3/8 only)
-        self.attn_p3 = EdgeSAB(c3_out, num_heads=num_heads, bias=False, reduction=2)  # Layer 23
+        self.down_p4 = Conv(c4_out, c4_out, k=3, s=2)  # Layer 21
+        self.c3k2_n5 = C3k2(c4_out + c5, c5_out, n=d(2), c3k=True)  # Layer 23 (N5/32)
 
     def forward(
         self,
@@ -1116,12 +1116,12 @@ class YOLOv11Neck(nn.Module):
         f_p4 = self.c3k2_p4(torch.cat([self.upsample1(p5), p4], dim=1))
         n3 = self.c3k2_p3(torch.cat([self.upsample2(f_p4), p3], dim=1))
 
+        # Inline EdgeSAB Self-Attention on P3/8 (propagates edge-enriched features into PAN)
+        n3 = self.attn_p3(n3, edge_map=edge_map)
+
         # Bottom-up PAN
         n4 = self.c3k2_n4(torch.cat([self.down_p3(n3), f_p4], dim=1))
         n5 = self.c3k2_n5(torch.cat([self.down_p4(n4), p5], dim=1))
-
-        # Pre-Head EdgeSAB Self-Attention on P3/8
-        n3 = self.attn_p3(n3, edge_map=edge_map)
 
         return [n3, n4, n5]
 
