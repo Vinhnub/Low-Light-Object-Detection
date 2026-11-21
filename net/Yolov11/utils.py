@@ -98,6 +98,12 @@ def smart_optimizer(
         elif hasattr(v, "weight") and isinstance(v.weight, nn.Parameter):
             g[1].append(v.weight)
 
+    # Catch standalone nn.Parameter attributes (e.g., EdgeSAB.temperature, gamma, edge_scale, EdgeExtractor.scale/offset)
+    included = {id(p) for group in g for p in group}
+    for p in de_parallel(model).parameters():
+        if id(p) not in included:
+            g[2].append(p)
+
     opt_name = name.upper()
     if opt_name == "ADAM":
         optimizer = torch.optim.Adam(g[2], lr=lr, betas=(momentum, 0.999))
@@ -168,7 +174,10 @@ def _register_ultralytics_unpickle_aliases() -> None:
         "C3k",
         "C3k2",
         "C3x",
+        "SAB",
         "DFL",
+        "EdgeSAB",
+        "EdgeExtractor",
         "GhostBottleneck",
         "PSA",
         "PSABlock",
@@ -279,8 +288,9 @@ def load_yolov11_checkpoint(
                 else m_obj
             )
 
-    # Bidirectional mapping between sequential `model.0..23.*` and modular `backbone/neck/head.*`
-    seq_to_mod_prefix = {
+    # Bidirectional mapping across 24L Base, 25L Skip-P3, 25L P3-Inline, 25L P3-PreHead,
+    # 27L Full EdgeSAB, and modular YOLOv11 via canonical modular slot names.
+    backbone_to_p4_to_mod = {
         "model.0.": "backbone.stem.",
         "model.1.": "backbone.stage1.0.",
         "model.2.": "backbone.stage1.1.",
@@ -293,38 +303,103 @@ def load_yolov11_checkpoint(
         "model.9.": "backbone.stage4.2.",
         "model.10.": "backbone.stage4.3.",
         "model.13.": "neck.c3k2_p4.",
+    }
+    backbone_fpn_to_mod = {
+        **backbone_to_p4_to_mod,
         "model.16.": "neck.c3k2_p3.",
+    }
+    base_seq_to_mod = {
+        **backbone_fpn_to_mod,
         "model.17.": "neck.down_p3.",
         "model.19.": "neck.c3k2_n4.",
         "model.20.": "neck.down_p4.",
         "model.22.": "neck.c3k2_n5.",
-        "model.23.": "head.",
     }
-    mod_to_seq_prefix = {v: k for k, v in seq_to_mod_prefix.items()}
+    arch_to_mod: Dict[str, Dict[str, str]] = {
+        "seq24": {**base_seq_to_mod, "model.23.": "head."},
+        "seq25_skip_p3": {
+            **backbone_to_p4_to_mod,
+            "model.15.": "neck.attn_p3.",
+            "model.17.": "neck.c3k2_p3.",
+            "model.18.": "neck.down_p3.",
+            "model.20.": "neck.c3k2_n4.",
+            "model.21.": "neck.down_p4.",
+            "model.23.": "neck.c3k2_n5.",
+            "model.24.": "head.",
+        },
+        "seq25_inline": {
+            **backbone_fpn_to_mod,
+            "model.17.": "neck.attn_p3.",
+            "model.18.": "neck.down_p3.",
+            "model.20.": "neck.c3k2_n4.",
+            "model.21.": "neck.down_p4.",
+            "model.23.": "neck.c3k2_n5.",
+            "model.24.": "head.",
+        },
+        "seq25_prehead": {
+            **base_seq_to_mod,
+            "model.23.": "neck.attn_p3.",
+            "model.24.": "head.",
+        },
+        "seq27": {
+            **base_seq_to_mod,
+            "model.23.": "neck.attn_p3.",
+            "model.24.": "neck.attn_p4.",
+            "model.25.": "neck.attn_p5.",
+            "model.26.": "head.",
+        },
+    }
+    all_mod_slots = set().union(*[m.values() for m in arch_to_mod.values()])
+    arch_to_mod["mod"] = {slot: slot for slot in all_mod_slots}
+
+    def _has_edgesab_at(keys: List[str], idx: int) -> bool:
+        p = f"model.{idx}."
+        return any(k.startswith((f"{p}q.", f"{p}gamma", f"{p}edge_gate.")) for k in keys)
+
+    def _has_detect_at(keys: List[str], idx: int) -> bool:
+        p = f"model.{idx}."
+        return any(k.startswith((f"{p}cv", f"{p}dfl")) for k in keys)
+
+    def _detect_arch(keys: List[str]) -> Optional[str]:
+        if any(k.startswith("backbone.") for k in keys):
+            return "mod"
+        if any(k.startswith("model.26.") for k in keys):
+            return "seq27"
+        if _has_detect_at(keys, 24):
+            if _has_edgesab_at(keys, 15):
+                return "seq25_skip_p3"
+            if _has_edgesab_at(keys, 17):
+                return "seq25_inline"
+            if _has_edgesab_at(keys, 23):
+                return "seq25_prehead"
+        if _has_detect_at(keys, 23):
+            return "seq24"
+        return None
+
+    clean_keys = [k[7:] if k.startswith("module.") else k for k in raw_state_dict.keys()]
+    src_arch = _detect_arch(clean_keys)
 
     target_model = de_parallel(model)
     model_dict = target_model.state_dict()
+    dst_arch = _detect_arch(list(model_dict.keys()))
+
+    prefix_map: Dict[str, str] = {}
+    if src_arch is not None and dst_arch is not None and src_arch != dst_arch:
+        src_map = arch_to_mod[src_arch]
+        dst_inv = {canon: dst_p for dst_p, canon in arch_to_mod[dst_arch].items()}
+        for src_p, canon in src_map.items():
+            prefix_map[src_p] = dst_inv.get(canon, "__unmapped__.")
+
     filtered_state_dict = {}
     for k, v in raw_state_dict.items():
         name = k[7:] if k.startswith("module.") else k
         if isinstance(v, torch.Tensor) and v.is_floating_point():
             v = v.float()
-        if name not in model_dict:
-            mapped = False
-            for seq_p, mod_p in seq_to_mod_prefix.items():
-                if name.startswith(seq_p):
-                    cand = mod_p + name[len(seq_p) :]
-                    if cand in model_dict:
-                        name = cand
-                        mapped = True
-                        break
-            if not mapped:
-                for mod_p, seq_p in mod_to_seq_prefix.items():
-                    if name.startswith(mod_p):
-                        cand = seq_p + name[len(mod_p) :]
-                        if cand in model_dict:
-                            name = cand
-                            break
+        if prefix_map:
+            for src_p, dst_p in prefix_map.items():
+                if name.startswith(src_p):
+                    name = dst_p + name[len(src_p) :]
+                    break
         if name in model_dict and model_dict[name].shape == v.shape:
             filtered_state_dict[name] = v
 
