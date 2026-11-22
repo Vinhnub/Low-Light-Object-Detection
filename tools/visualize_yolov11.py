@@ -718,7 +718,7 @@ def load_yolov11_model(
         nc = _infer_nc_from_state_dict(raw_sd)
     nc = int(nc or 12)
 
-    has_enhanced_code = hasattr(Yolov11, "EdgeSAB") and hasattr(Yolov11, "EdgeExtractor")
+    has_enhanced_code = hasattr(Yolov11, "SAB") or hasattr(Yolov11, "EdgeSAB")
     cfg_path = cfg_override.strip() if (cfg_override and os.path.exists(cfg_override.strip())) else ""
 
     enhanced_mode = "none"
@@ -1297,7 +1297,7 @@ def trace_edgesab_module(
 
         edge_scaled: Optional[torch.Tensor] = None
         edge_weight: Optional[torch.Tensor] = None
-        if edge_map is not None:
+        if edge_map is not None and hasattr(mod, "edge_scale"):
             em = edge_map.detach().float().to(dev)
             if em.shape[-2:] != (h, w):
                 edge_bil = F.interpolate(em, size=(h, w), mode="bilinear", align_corners=False)
@@ -1344,7 +1344,7 @@ def trace_edgesab_module(
             mod.project_out.bias.float() if mod.project_out.bias is not None else None,
         )
 
-        if edge_scaled is not None:
+        if edge_scaled is not None and hasattr(mod, "edge_gate"):
             eg_mod = mod.edge_gate
             eg_feat = F.conv2d(
                 edge_scaled,
@@ -1404,7 +1404,7 @@ def trace_edgesab_module(
             "num_heads": num_heads,
             "head_dim": head_dim,
             "hw": [h, w],
-            "edge_scale": round(float(mod.edge_scale.detach().float().item()), 6),
+            "edge_scale": round(float(mod.edge_scale.detach().float().item()), 6) if hasattr(mod, "edge_scale") else 0.0,
             "gamma_mean": round(float(gamma_f.mean().item()), 6),
             "gamma_abs_mean": round(float(gamma_f.abs().mean().item()), 6),
             "gamma_abs_max": round(float(gamma_f.abs().max().item()), 6),
@@ -2263,8 +2263,8 @@ def save_edgesab_attention_details(
     th, tw = base_tile.shape[:2]
 
     by_idx = {r["layer_idx"]: r for r in records.values() if not r["is_sublayer"] and "tensor" in r}
-    pre_idx_map = {17: 16, 23: 16, 24: 19, 25: 22}
-    scale_names = {17: "P3/8 Inline (L17)", 23: "P3/8 (L23)", 24: "P4/16 (L24)", 25: "P5/32 (L25)"}
+    pre_idx_map = {15: 4, 17: 16, 23: 16, 24: 19, 25: 22}
+    scale_names = {15: "P3/8 Skip (L15)", 17: "P3/8 Inline (L17)", 23: "P3/8 (L23)", 24: "P4/16 (L24)", 25: "P5/32 (L25)"}
 
     tiles: List[np.ndarray] = []
     for label, tr in edgesab_traces.items():
@@ -2828,22 +2828,24 @@ def run_single_model_on_image(
     edge_trace: Optional[Dict[str, Any]] = None
     edgesab_traces: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 
-    if arch == "enhanced" and getattr(model, "edge_extractor", None) is not None:
+    if arch == "enhanced" and (getattr(model, "edge_extractor", None) is not None or recorder.edgesab_modules):
         edge_dir = str(run_dir / "edge")
         os.makedirs(edge_dir, exist_ok=True)
-        edge_trace = trace_edge_extractor(model.edge_extractor, tensor)
+        edge_map_for_sab: Optional[torch.Tensor] = None
+        if getattr(model, "edge_extractor", None) is not None:
+            edge_trace = trace_edge_extractor(model.edge_extractor, tensor)
 
-        if recorder.edge_map is not None:
-            ee_diff = float((edge_trace["priority_tensor"] - recorder.edge_map).abs().max().item())
-            if ee_diff > 1e-3:
-                print(f"[Warn] EdgeExtractor trace max diff = {ee_diff:.6f}")
+            if recorder.edge_map is not None:
+                ee_diff = float((edge_trace["priority_tensor"] - recorder.edge_map).abs().max().item())
+                if ee_diff > 1e-3:
+                    print(f"[Warn] EdgeExtractor trace max diff = {ee_diff:.6f}")
 
-        save_edge_extractor_pipeline(
-            str(run_dir / "05_edge_extractor_pipeline.png"),
-            edge_dir, display_bgr, edge_trace, args.imgsz, crop_box, args, img_name,
-        )
+            save_edge_extractor_pipeline(
+                str(run_dir / "05_edge_extractor_pipeline.png"),
+                edge_dir, display_bgr, edge_trace, args.imgsz, crop_box, args, img_name,
+            )
+            edge_map_for_sab = recorder.edge_map if recorder.edge_map is not None else edge_trace["priority_tensor"]
 
-        edge_map_for_sab = recorder.edge_map if recorder.edge_map is not None else edge_trace["priority_tensor"]
         for sab_label, (sab_idx, sab_mod) in recorder.edgesab_modules.items():
             x_in = recorder.edgesab_inputs.get(sab_label)
             if x_in is None:
@@ -2868,7 +2870,7 @@ def run_single_model_on_image(
             "image": img_name,
             "model": model_name,
             "arch": arch,
-            "edge_extractor": edge_trace["params"],
+            "edge_extractor": edge_trace["params"] if edge_trace is not None else None,
             "edge_sab": {lbl: tr["stats"] for lbl, tr in edgesab_traces.items()},
         }
         with open(os.path.join(edge_dir, "edge_stats.json"), "w", encoding="utf-8") as jf:

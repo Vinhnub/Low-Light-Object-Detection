@@ -98,7 +98,7 @@ def smart_optimizer(
         elif hasattr(v, "weight") and isinstance(v.weight, nn.Parameter):
             g[1].append(v.weight)
 
-    # Catch standalone nn.Parameter attributes (e.g., EdgeSAB.temperature, gamma, edge_scale, EdgeExtractor.scale/offset)
+    # Catch standalone nn.Parameter attributes (e.g., SAB.temperature, gamma)
     included = {id(p) for group in g for p in group}
     for p in de_parallel(model).parameters():
         if id(p) not in included:

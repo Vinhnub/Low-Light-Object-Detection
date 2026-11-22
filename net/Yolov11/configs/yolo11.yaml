@@ -34,8 +34,8 @@ head:
   - [-1, 2, C3k2, [512, False]] # 13
 
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 14
-  - [4, 1, EdgeSAB, [4, False, 2]] # 15 (Backbone P3/8 Skip EdgeSAB before Concat)
-  - [[14, -1], 1, Concat, [1]] # 16 cat upsample P4 & edge-enriched backbone P3
+  - [4, 1, SAB, [4, False, 2]] # 15 (Backbone P3/8 Skip SAB Transposed Attention before Concat)
+  - [[14, -1], 1, Concat, [1]] # 16 cat upsample P4 & attention-enriched backbone P3
   - [-1, 2, C3k2, [256, False]] # 17 (FPN P3/8-small -> feeds Detect P3 & PAN)
 
   - [-1, 1, Conv, [256, 3, 2]] # 18 (PAN Down from P3)
