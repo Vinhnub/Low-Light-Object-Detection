@@ -25,6 +25,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from data.data import (
+    get_darkface_test_set,
     get_darkface_val_set,
     get_exdark_test_set,
     get_exdark_val_set,
@@ -832,8 +833,17 @@ if __name__ == "__main__":
                 path=path, img_size=args.imgSize, augment=False, class_names=class_names
             )
     elif ds_name == "darkface":
-        path = args.data_dir or "./dataset/DarkFace"
-        dataset = get_darkface_val_set(path, size=args.imgSize)
+        if args.split == "test":
+            path = args.data_dir or "./dataset/DarkFace/images/test"
+            dataset = get_darkface_test_set(path, size=args.imgSize)
+        elif args.split == "val":
+            path = args.data_dir or "./dataset/DarkFace/images/val"
+            dataset = get_darkface_val_set(path, size=args.imgSize)
+        else:
+            path = args.data_dir or "./dataset/DarkFace/images/train"
+            dataset = YOLODataset(
+                path=path, img_size=args.imgSize, augment=False, class_names=class_names
+            )
     else:
         default_dir = (
             f"./dataset/{args.dataset.upper()}/images/{args.split}"
@@ -861,7 +871,9 @@ if __name__ == "__main__":
     elif ds_name == "exdark":
         gt_dir = f"./dataset/ExDark/labels_raw/{args.split}"
     elif ds_name == "darkface":
-        gt_dir = "./dataset/DarkFace/label"
+        gt_dir = f"./dataset/DarkFace/labels_raw/{args.split}"
+        if not os.path.exists(gt_dir) and os.path.exists("./dataset/DarkFace/label"):
+            gt_dir = "./dataset/DarkFace/label"
     elif ds_name == "voc":
         gt_dir = f"./dataset/VOC/labels/{args.split}"
     else:
