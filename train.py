@@ -315,7 +315,11 @@ def load_datasets():
             opt.data_train_darkface, size=opt.imgSize, hyp=opt
         )
         val_set = get_darkface_val_set(opt.data_val_darkface, size=opt.imgSize, hyp=opt)
-        test_set = val_set
+        test_set = (
+            get_darkface_test_set(opt.data_test_darkface, size=opt.imgSize, hyp=test_no_cache_hyp)
+            if os.path.exists(opt.data_test_darkface)
+            else val_set
+        )
     elif opt.dataset == "voc":
         train_set = get_training_set(
             opt.data_train_voc, size=opt.imgSize, dataset_name="voc", hyp=opt
@@ -631,7 +635,11 @@ if __name__ == "__main__":
         )
     elif opt.dataset == "darkface":
         val_label_dir = opt.data_valgt_darkface
-        test_label_dir = opt.data_valgt_darkface
+        test_label_dir = (
+            opt.data_testgt_darkface
+            if os.path.exists(opt.data_testgt_darkface)
+            else opt.data_valgt_darkface
+        )
     elif opt.dataset == "voc":
         val_label_dir = opt.data_valgt_voc
         test_label_dir = opt.data_valgt_voc
