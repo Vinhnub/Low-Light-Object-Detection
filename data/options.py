@@ -199,8 +199,8 @@ def option():
     parser.add_argument(
         "--data_train_darkface",
         type=str,
-        default="./dataset/DarkFace",
-        help="DarkFace dataset root or train images directory",
+        default="./dataset/DarkFace/images/train",
+        help="DarkFace training images directory or train.txt path",
     )
     parser.add_argument(
         "--data_train_voc",
@@ -231,8 +231,14 @@ def option():
     parser.add_argument(
         "--data_val_darkface",
         type=str,
-        default="./dataset/DarkFace",
-        help="DarkFace validation directory",
+        default="./dataset/DarkFace/images/val",
+        help="DarkFace validation images directory or val.txt path",
+    )
+    parser.add_argument(
+        "--data_test_darkface",
+        type=str,
+        default="./dataset/DarkFace/images/test",
+        help="DarkFace test images directory or test.txt path",
     )
     parser.add_argument(
         "--data_val_voc",
@@ -263,8 +269,14 @@ def option():
     parser.add_argument(
         "--data_valgt_darkface",
         type=str,
-        default="./dataset/DarkFace/label",
-        help="DarkFace ground truth labels directory",
+        default="./dataset/DarkFace/labels_raw/val",
+        help="DarkFace validation ground truth labels directory",
+    )
+    parser.add_argument(
+        "--data_testgt_darkface",
+        type=str,
+        default="./dataset/DarkFace/labels_raw/test",
+        help="DarkFace test ground truth labels directory",
     )
     parser.add_argument(
         "--data_valgt_voc",

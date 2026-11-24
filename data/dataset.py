@@ -591,9 +591,10 @@ class DarkFaceDataset(YOLODataset):
     """
     DarkFace Low-Light Face Detection Dataset Loader (1 class: 'Face').
     Supports:
-      - Unsplit layout: `dataset/DarkFace/image/*.png` + `dataset/DarkFace/label/*.txt`
-        (automatically performs a deterministic 85% train / 15% val split based on sorted filenames)
-      - Split layout: `dataset/DarkFace/images/{train,val}` + `dataset/DarkFace/labels/{train,val}`
+      - `data_dir` pointing directly to `dataset/DarkFace/images/train` (or `val`, `test`)
+      - `data_dir` pointing to `dataset/DarkFace` root + `split in {'train', 'val', 'test'}`
+      - `data_dir` pointing to `dataset/DarkFace/train.txt` (or `val.txt`, `test.txt`)
+      - Legacy unsplit layout: `dataset/DarkFace/image/*.png` + `dataset/DarkFace/label/*.txt`
     """
 
     def __init__(
@@ -614,6 +615,8 @@ class DarkFaceDataset(YOLODataset):
         label_dir = None
         if data_path.is_dir() and (data_path / "images" / split).exists():
             resolved_path: Union[Path, List[str]] = data_path / "images" / split
+        elif data_path.is_dir() and (data_path / f"{split}.txt").exists():
+            resolved_path = data_path / f"{split}.txt"
         elif data_path.is_dir() and (data_path / "image").exists():
             all_imgs = self._resolve_image_files(data_path / "image")
             rng = random.Random(seed)

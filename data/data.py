@@ -63,7 +63,7 @@ def get_exdark_test_set(
 
 
 def get_darkface_training_set(
-    data_dir: str = "./dataset/DarkFace",
+    data_dir: str = "./dataset/DarkFace/images/train",
     size: int = 640,
     hyp: Optional[Union[Dict[str, Any], Any]] = None,
 ) -> DarkFaceDataset:
@@ -78,14 +78,29 @@ def get_darkface_training_set(
 
 
 def get_darkface_val_set(
-    data_dir: str = "./dataset/DarkFace",
+    data_dir: str = "./dataset/DarkFace/images/val",
     size: int = 640,
     hyp: Optional[Union[Dict[str, Any], Any]] = None,
 ) -> DarkFaceDataset:
-    """Return DarkFace validation dataset (letterbox only)."""
+    """Return DarkFace validation dataset (letterbox only, no random augmentation)."""
     return DarkFaceDataset(
         data_dir=data_dir,
         split="val",
+        img_size=size,
+        augment=False,
+        hyp=hyp,
+    )
+
+
+def get_darkface_test_set(
+    data_dir: str = "./dataset/DarkFace/images/test",
+    size: int = 640,
+    hyp: Optional[Union[Dict[str, Any], Any]] = None,
+) -> DarkFaceDataset:
+    """Return DarkFace test dataset (letterbox only, no random augmentation)."""
+    return DarkFaceDataset(
+        data_dir=data_dir,
+        split="test",
         img_size=size,
         augment=False,
         hyp=hyp,
@@ -174,11 +189,14 @@ def create_dataloader(
             dataset = get_exdark_test_set(path, size=img_size)
     elif ds_name == "darkface":
         if split == "train":
-            path = getattr(opt, "data_train_darkface", "./dataset/DarkFace")
+            path = getattr(opt, "data_train_darkface", "./dataset/DarkFace/images/train")
             dataset = get_darkface_training_set(path, size=img_size, hyp=opt)
-        else:
-            path = getattr(opt, "data_val_darkface", "./dataset/DarkFace")
+        elif split == "val":
+            path = getattr(opt, "data_val_darkface", "./dataset/DarkFace/images/val")
             dataset = get_darkface_val_set(path, size=img_size)
+        else:
+            path = getattr(opt, "data_test_darkface", "./dataset/DarkFace/images/test")
+            dataset = get_darkface_test_set(path, size=img_size)
     elif ds_name == "voc":
         path = (
             getattr(opt, "data_train_voc", "./dataset/VOC/images/train")

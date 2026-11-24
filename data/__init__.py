@@ -4,6 +4,7 @@ Data Package (`data`) for Low-Light Object Detection.
 
 from data.data import (
     create_dataloader,
+    get_darkface_test_set,
     get_darkface_training_set,
     get_darkface_val_set,
     get_eval_set,
@@ -54,6 +55,7 @@ __all__ = [
     "get_exdark_test_set",
     "get_darkface_training_set",
     "get_darkface_val_set",
+    "get_darkface_test_set",
     "get_training_set",
     "get_eval_set",
     "create_dataloader",
