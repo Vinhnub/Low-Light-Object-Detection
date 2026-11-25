@@ -47,6 +47,7 @@ from .common import (
     ConvTranspose,
     DWConv,
     DWConvTranspose2d,
+    EdgeExtractor,
     EdgeSAB,
     Focus,
     GhostBottleneck,
@@ -98,31 +99,32 @@ def get_yolov11_cfg_dict(
             # [from, repeats, module, args]
             [-1, 1, "Conv", [64, 3, 2]],               # 0-P1/2
             [-1, 1, "Conv", [128, 3, 2]],              # 1-P2/4
-            [-1, 2, "C3k2", [256, False, 0.25]],       # 2
-            [-1, 1, "Conv", [256, 3, 2]],              # 3-P3/8
-            [-1, 2, "C3k2", [512, False, 0.25]],       # 4
-            [-1, 1, "Conv", [512, 3, 2]],              # 5-P4/16
-            [-1, 2, "C3k2", [512, True]],              # 6
-            [-1, 1, "Conv", [1024, 3, 2]],             # 7-P5/32
-            [-1, 2, "C3k2", [1024, True]],             # 8
-            [-1, 1, "SPPF", [1024, 5]],                # 9
-            [-1, 2, "C2PSA", [1024]],                  # 10
+            [-1, 2, "C3k2", [256, False, 0.25]],       # 2-P2/4
+            [-1, 1, "EdgeSAB", [4, False, 2]],         # 3-P2/4 (160x160 Edge-Guided SAB, gamma=0.1, edge_scale=2.0)
+            [-1, 1, "Conv", [256, 3, 2]],              # 4-P3/8
+            [-1, 2, "C3k2", [512, False, 0.25]],       # 5-P3/8
+            [-1, 1, "Conv", [512, 3, 2]],              # 6-P4/16
+            [-1, 2, "C3k2", [512, True]],              # 7-P4/16
+            [-1, 1, "Conv", [1024, 3, 2]],             # 8-P5/32
+            [-1, 2, "C3k2", [1024, True]],             # 9-P5/32
+            [-1, 1, "SPPF", [1024, 5]],                # 10
+            [-1, 2, "C2PSA", [1024]],                  # 11
         ],
         "head": [
-            [-1, 1, "nn.Upsample", [None, 2, "nearest"]],  # 11
-            [[-1, 6], 1, "Concat", [1]],                   # 12 cat backbone P4
-            [-1, 2, "C3k2", [512, False]],                 # 13
-            [-1, 1, "nn.Upsample", [None, 2, "nearest"]],  # 14
-            [4, 1, "SAB", [4, False, 2]],                  # 15 (Backbone P3/8 Skip SAB Transposed Attention before Concat)
-            [[14, -1], 1, "Concat", [1]],                  # 16 cat upsample P4 & attention-enriched backbone P3
-            [-1, 2, "C3k2", [256, False]],                 # 17 (FPN P3/8-small -> Detect P3 & PAN)
-            [-1, 1, "Conv", [256, 3, 2]],                  # 18 (PAN Down from P3)
-            [[-1, 13], 1, "Concat", [1]],                  # 19 cat head P4
-            [-1, 2, "C3k2", [512, False]],                 # 20 (P4/16-medium)
-            [-1, 1, "Conv", [512, 3, 2]],                  # 21 (PAN Down from P4)
-            [[-1, 10], 1, "Concat", [1]],                  # 22 cat head P5
-            [-1, 2, "C3k2", [1024, True]],                 # 23 (P5/32-large)
-            [[17, 20, 23], 1, "Detect", ["nc"]],           # 24 Detect(P3, P4, P5)
+            [-1, 1, "nn.Upsample", [None, 2, "nearest"]],  # 12
+            [[-1, 7], 1, "Concat", [1]],                   # 13 cat backbone P4
+            [-1, 2, "C3k2", [512, False]],                 # 14
+            [-1, 1, "nn.Upsample", [None, 2, "nearest"]],  # 15
+            [5, 1, "SAB", [4, False, 2]],                  # 16 (Backbone P3/8 Skip SAB Transposed Attention before Concat)
+            [[15, -1], 1, "Concat", [1]],                  # 17 cat upsample P4 & attention-enriched backbone P3
+            [-1, 2, "C3k2", [256, False]],                 # 18 (FPN P3/8-small -> Detect P3 & PAN)
+            [-1, 1, "Conv", [256, 3, 2]],                  # 19 (PAN Down from P3)
+            [[-1, 14], 1, "Concat", [1]],                  # 20 cat head P4
+            [-1, 2, "C3k2", [512, False]],                 # 21 (P4/16-medium)
+            [-1, 1, "Conv", [512, 3, 2]],                  # 22 (PAN Down from P4)
+            [[-1, 11], 1, "Concat", [1]],                  # 23 cat head P5
+            [-1, 2, "C3k2", [1024, True]],                 # 24 (P5/32-large)
+            [[18, 21, 24], 1, "Detect", ["nc"]],           # 25 Detect(P3, P4, P5)
         ],
     }
 
@@ -724,6 +726,11 @@ class BaseModel(nn.Module):
     def _forward_once(
         self, x: torch.Tensor, profile: bool = False, visualize: bool = False
     ):
+        edge_map = (
+            self.edge_extractor(x)
+            if hasattr(self, "edge_extractor") and self.edge_extractor is not None
+            else None
+        )
         y = []
         for m in self.model:
             if m.f != -1:
@@ -732,7 +739,10 @@ class BaseModel(nn.Module):
                     if isinstance(m.f, int)
                     else [x if j == -1 else y[j] for j in m.f]
                 )
-            x = m(x)
+            if isinstance(m, EdgeSAB):
+                x = m(x, edge_map=edge_map)
+            else:
+                x = m(x)
             y.append(x if m.i in self.save else None)
         return x
 
@@ -826,6 +836,11 @@ class DetectionModel(BaseModel):
             self.yaml["nc"] = nc
 
         self.model, self.save = parse_model(copy.deepcopy(self.yaml), ch=ch)
+        self.edge_extractor = (
+            EdgeExtractor(in_channels=ch, rgb_to_gray=(ch == 3))
+            if any(isinstance(m, EdgeSAB) for m in self.model)
+            else None
+        )
         self.names = [str(i) for i in range(self.yaml["nc"])]
         self.inplace = self.yaml.get("inplace", True)
 
@@ -1020,20 +1035,24 @@ class YOLOv11Backbone(nn.Module):
             Conv(c(64), c(128), k=3, s=2),
             C3k2(c(128), c(256), n=d(2), c3k=c3k_override, e=0.25),
         )
+        # Layer 3: P2/4 (160x160) Edge-Guided Self-Attention
+        self.attn_p2 = EdgeSAB(
+            c(256), num_heads=4, bias=False, reduction=2, gamma_init=0.1, edge_scale_init=2.0
+        )
 
-        # Layer 3-4: P3/8
+        # Layer 4-5: P3/8
         self.stage2 = nn.Sequential(
             Conv(c(256), c(256), k=3, s=2),
             C3k2(c(256), c(512), n=d(2), c3k=c3k_override, e=0.25),
         )
 
-        # Layer 5-6: P4/16
+        # Layer 6-7: P4/16
         self.stage3 = nn.Sequential(
             Conv(c(512), c(512), k=3, s=2),
             C3k2(c(512), c(512), n=d(2), c3k=True),
         )
 
-        # Layer 7-10: P5/32 + SPPF + C2PSA
+        # Layer 8-11: P5/32 + SPPF + C2PSA
         self.stage4 = nn.Sequential(
             Conv(c(512), c(1024), k=3, s=2),
             C3k2(c(1024), c(1024), n=d(2), c3k=True),
@@ -1042,13 +1061,14 @@ class YOLOv11Backbone(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor
+        self, x: torch.Tensor, edge_map: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        x = self.stem(x)      # P1/2
-        x = self.stage1(x)    # P2/4
-        p3 = self.stage2(x)   # P3/8
-        p4 = self.stage3(p3)  # P4/16
-        p5 = self.stage4(p4)  # P5/32
+        x = self.stem(x)                          # P1/2
+        x = self.stage1(x)                        # P2/4
+        x = self.attn_p2(x, edge_map=edge_map)    # P2/4 EdgeSAB
+        p3 = self.stage2(x)                       # P3/8
+        p4 = self.stage3(p3)                      # P4/16
+        p5 = self.stage4(p4)                      # P5/32
         return p3, p4, p5
 
 
@@ -1142,6 +1162,7 @@ class YOLOv11(nn.Module):
         self.names = [str(i) for i in range(num_classes)]
         self.inplace = inplace
 
+        self.edge_extractor = EdgeExtractor(in_channels=in_channels, rgb_to_gray=(in_channels == 3))
         self.backbone = YOLOv11Backbone(
             in_channels=in_channels,
             depth_multiple=depth_multiple,
@@ -1188,12 +1209,14 @@ class YOLOv11(nn.Module):
     def extract_features(
         self, x: torch.Tensor
     ) -> Tuple[Tuple[torch.Tensor, ...], List[torch.Tensor]]:
-        backbone_feats = self.backbone(x)
+        edge_map = self.edge_extractor(x)
+        backbone_feats = self.backbone(x, edge_map=edge_map)
         neck_feats = self.neck(backbone_feats)
         return backbone_feats, neck_feats
 
     def forward(self, x: torch.Tensor):
-        p3, p4, p5 = self.backbone(x)
+        edge_map = self.edge_extractor(x)
+        p3, p4, p5 = self.backbone(x, edge_map=edge_map)
         neck_feats = self.neck((p3, p4, p5))
         return self.head(neck_feats)
 
