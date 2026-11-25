@@ -341,6 +341,27 @@ def load_yolov11_checkpoint(
             "model.23.": "neck.attn_p3.",
             "model.24.": "head.",
         },
+        "seq25_p2_edgesab": {
+            "model.0.": "backbone.stem.",
+            "model.1.": "backbone.stage1.0.",
+            "model.2.": "backbone.stage1.1.",
+            "model.3.": "backbone.attn_p2.",
+            "model.4.": "backbone.stage2.0.",
+            "model.5.": "backbone.stage2.1.",
+            "model.6.": "backbone.stage3.0.",
+            "model.7.": "backbone.stage3.1.",
+            "model.8.": "backbone.stage4.0.",
+            "model.9.": "backbone.stage4.1.",
+            "model.10.": "backbone.stage4.2.",
+            "model.11.": "backbone.stage4.3.",
+            "model.14.": "neck.c3k2_p4.",
+            "model.17.": "neck.c3k2_p3.",
+            "model.18.": "neck.down_p3.",
+            "model.20.": "neck.c3k2_n4.",
+            "model.21.": "neck.down_p4.",
+            "model.23.": "neck.c3k2_n5.",
+            "model.24.": "head.",
+        },
         "seq26_p2_edgesab_skip_p3": {
             "model.0.": "backbone.stem.",
             "model.1.": "backbone.stage1.0.",
@@ -390,6 +411,8 @@ def load_yolov11_checkpoint(
         if _has_detect_at(keys, 25) and _has_edgesab_at(keys, 3):
             return "seq26_p2_edgesab_skip_p3"
         if _has_detect_at(keys, 24):
+            if _has_edgesab_at(keys, 3):
+                return "seq25_p2_edgesab"
             if _has_edgesab_at(keys, 15):
                 return "seq25_skip_p3"
             if _has_edgesab_at(keys, 17):

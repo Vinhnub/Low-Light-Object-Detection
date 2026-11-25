@@ -4,12 +4,13 @@ tools/visualize_backbone_edgesab_yolov11.py
 Visualize YOLOv11 Backbone features (160 -> 80 -> 40 -> 20) together with full
 Low-Light EdgeExtractor + P2 EdgeSAB (160x160) + Skip-P3 SAB (80x80) internals.
 
-Designed for the 26-layer `develop-yolov11-p2-edgesab-skip-p3-sab` architecture
-(and backward-compatible with 24L Base / 25L Skip-P3 / modular YOLOv11 checkpoints):
+Designed for the 25-layer `develop-yolov11-p2-edgesab` architecture (Backbone P2 160x160 EdgeSAB,
+standard FPN+PAN Neck without Skip-P3 SAB) and backward-compatible with 24L Base, 25L Skip-P3,
+26L P2-EdgeSAB+Skip-P3-SAB, and modular YOLOv11 checkpoints:
   - EdgeExtractor (640 -> 160): Luminance, Weber-Log compression, Sobel/Laplacian fusion,
                                 Priority Edge Map, and MultiScaleEdgeGate at 160x160
   - Stage 1 (P2/4,  160x160): L01_Conv -> L02_C3k2 (Pre-EdgeSAB) -> L03_EdgeSAB (Post-EdgeSAB)
-  - Stage 2 (P3/8,   80x80 ): L04_Conv -> L05_C3k2 (Skip-P3 Source) -> L16_SAB (Skip-P3 Refined)
+  - Stage 2 (P3/8,   80x80 ): L04_Conv -> L05_C3k2 (Skip-P3 Source)
   - Stage 3 (P4/16,  40x40 ): L06_Conv -> L07_C3k2 (Skip-P4 Source)
   - Stage 4 (P5/32,  20x20 ): L08_Conv -> L09_C3k2 -> L10_SPPF -> L11_C2PSA (Skip-P5 Source)
 
@@ -17,9 +18,9 @@ Outputs saved under `<output>/<run_name>/<image_stem>/`:
   - `00_backbone_pyramid_160_to_20.png`    - Key pyramid stages (L02 Pre -> L03 EdgeSAB 160 -> 80 -> 40 -> 20)
   - `01_edge_extractor_and_p2_edgesab.png` - EdgeExtractor pipeline (Weber-Log, Gradients, Priority Map) +
                                              EdgeSAB internals (Q/K Edge Weight, MultiScaleEdgeGate, |L03-L02| Delta)
-  - `02_all_backbone_layers_160_to_20.png` - Chronological progression across L01..L11 (+ L16 Skip-P3 SAB)
-  - `03_skip_p3_sab_and_stage4_20x20.png`  - Skip-P3 SAB (80x80) & Stage 4 SPPF->C2PSA (20x20) refinement + Deltas
-  - `04_backbone_activation_stats.png`     - Quantitative L2 energy, Max, Sparsity + learned Edge/SAB scalars
+  - `02_all_backbone_layers_160_to_20.png` - Chronological progression across L01..L11
+  - `03_stage4_c2psa_20x20.png`            - Stage 4 SPPF->C2PSA (20x20) refinement (+ Skip-P3 SAB if present)
+  - `04_backbone_activation_stats.png`     - Quantitative L2 energy, Max, Sparsity + learned Edge/EdgeSAB scalars
   - `05_backbone_comparison_160_to_20.png` - Side-by-side comparison across semantic stages (when `--compare_weights` set)
   - `edge/`                                - Standalone borderless edge & gate maps for papers/slides
   - `layers/<layer_name>/`                 - Standalone maps + Top-K individual channel sheets
@@ -177,8 +178,8 @@ def parse_args() -> argparse.Namespace:
         "--arch",
         type=str,
         default="auto",
-        choices=["auto", "p2_edgesab", "skip_p3_sab", "skip_p3_edgesab", "base"],
-        help="Architecture variant ('auto' matches each checkpoint exactly, or 26L p2_edgesab for 'auto'/'none' weights).",
+        choices=["auto", "p2_edgesab", "p2_edgesab_skip_p3", "skip_p3_sab", "skip_p3_edgesab", "base"],
+        help="Architecture variant ('auto' matches each checkpoint exactly, or 25L p2_edgesab for 'auto'/'none' weights).",
     )
     parser.add_argument(
         "--source",
@@ -365,6 +366,8 @@ def detect_ckpt_arch(ckpt_meta: Any) -> Optional[str]:
         return any(k.startswith((f"{p}q.", f"{p}gamma", f"{p}edge_gate.")) for k in keys)
 
     if _has_detect(25) and _has_sab(3):
+        return "p2_edgesab_skip_p3"
+    if _has_detect(24) and _has_sab(3):
         return "p2_edgesab"
     if _has_detect(24) and _has_sab(15):
         if any(k.startswith("model.15.edge_gate.") for k in keys):
@@ -378,6 +381,39 @@ def detect_ckpt_arch(ckpt_meta: Any) -> Optional[str]:
 def _build_legacy_cfg_dict(model_name: str, nc: int, arch: str) -> Dict[str, Any]:
     variant = model_name.lower().replace("yolov11", "").replace("yolo11", "")
     scales = {k: list(v) for k, v in YOLOV11_SCALES.items()}
+    if arch == "p2_edgesab_skip_p3":
+        backbone_p2 = [
+            [-1, 1, "Conv", [64, 3, 2]],
+            [-1, 1, "Conv", [128, 3, 2]],
+            [-1, 2, "C3k2", [256, False, 0.25]],
+            [-1, 1, "EdgeSAB", [4, False, 2]],
+            [-1, 1, "Conv", [256, 3, 2]],
+            [-1, 2, "C3k2", [512, False, 0.25]],
+            [-1, 1, "Conv", [512, 3, 2]],
+            [-1, 2, "C3k2", [512, True]],
+            [-1, 1, "Conv", [1024, 3, 2]],
+            [-1, 2, "C3k2", [1024, True]],
+            [-1, 1, "SPPF", [1024, 5]],
+            [-1, 2, "C2PSA", [1024]],
+        ]
+        head_26 = [
+            [-1, 1, "nn.Upsample", [None, 2, "nearest"]],
+            [[-1, 7], 1, "Concat", [1]],
+            [-1, 2, "C3k2", [512, False]],
+            [-1, 1, "nn.Upsample", [None, 2, "nearest"]],
+            [5, 1, "SAB", [4, False, 2]],
+            [[15, -1], 1, "Concat", [1]],
+            [-1, 2, "C3k2", [256, False]],
+            [-1, 1, "Conv", [256, 3, 2]],
+            [[-1, 14], 1, "Concat", [1]],
+            [-1, 2, "C3k2", [512, False]],
+            [-1, 1, "Conv", [512, 3, 2]],
+            [[-1, 11], 1, "Concat", [1]],
+            [-1, 2, "C3k2", [1024, True]],
+            [[18, 21, 24], 1, "Detect", ["nc"]],
+        ]
+        return {"nc": nc, "scale": variant, "scales": scales, "backbone": backbone_p2, "head": head_26}
+
     backbone_base = [
         [-1, 1, "Conv", [64, 3, 2]],
         [-1, 1, "Conv", [128, 3, 2]],
@@ -478,7 +514,11 @@ def load_yolov11_model(
     resolved_arch = arch_override
     if resolved_arch == "auto":
         detected = detect_ckpt_arch(ckpt_meta) if ckpt_meta is not None else None
-        resolved_arch = detected if detected in {"base", "skip_p3_sab", "skip_p3_edgesab", "p2_edgesab"} else "p2_edgesab"
+        resolved_arch = (
+            detected
+            if detected in {"base", "skip_p3_sab", "skip_p3_edgesab", "p2_edgesab", "p2_edgesab_skip_p3"}
+            else "p2_edgesab"
+        )
 
     if cfg_path is not None or is_modular or resolved_arch == "p2_edgesab":
         model = build_yolo_model(
@@ -1291,10 +1331,21 @@ def build_all_layers_progression_figure(
         native_tiles.append(make_labeled_tile(nat_bgr, f"L{rec['layer_idx']:02d} Native {h_f}x{w_f}", sub, accent))
 
     ncols = min(6, max(1, len(overlay_tiles)))
+    rem = len(overlay_tiles) % ncols
+    if rem != 0:
+        blank_tile = np.full_like(overlay_tiles[0], (18, 20, 24))
+        overlay_tiles.extend([blank_tile] * (ncols - rem))
+        native_tiles.extend([blank_tile] * (ncols - rem))
+    has_skip_sab = any(r.get("accent_key") == "p3_sab" for r in records.values())
+    prog_title = (
+        f"Full Backbone + EdgeSAB + Skip-P3 SAB Progression — {model_title}"
+        if has_skip_sab
+        else f"Full Backbone + P2 EdgeSAB Progression (160 -> 80 -> 40 -> 20) — {model_title}"
+    )
     return assemble_grid(
         overlay_tiles + native_tiles,
         ncols=ncols,
-        banner_title=f"Full Backbone + EdgeSAB + Skip-P3 SAB Progression — {model_title}",
+        banner_title=prog_title,
         banner_sub="Top block: Spatial L2 Overlay | Bottom block: Discrete Native-Resolution Heatmaps (160 -> 80 -> 40 -> 20)",
         colormap_id=colormap_id,
     )
@@ -1356,11 +1407,17 @@ def build_skip_p3_and_stage4_figure(
     if not all_tiles:
         return None
     ncols = max(len(s4_tiles), len(p3_tiles), 1)
+    if p3_tiles:
+        b_title = f"Attention Refinement: Stage 4 C2PSA (20x20) & Neck Skip-P3 SAB (80x80) — {model_title}"
+        b_sub = "Row 1: Stage 4 (Conv -> C3k2 -> SPPF -> C2PSA + Delta) | Row 2: Lateral Skip-P3 SAB (Pre, Post, Delta & Native 80x80)"
+    else:
+        b_title = f"Stage 4 (20x20) Refinement: Conv -> C3k2 -> SPPF -> C2PSA & Delta — {model_title}"
+        b_sub = "20x20 Spatial L2 Overlays across Stage 4 + C2PSA Attention Residual |C2PSA - SPPF|"
     return assemble_grid(
         all_tiles,
         ncols=ncols,
-        banner_title=f"Attention Refinement: Stage 4 C2PSA (20x20) & Neck Skip-P3 SAB (80x80) — {model_title}",
-        banner_sub="Row 1: Stage 4 (Conv -> C3k2 -> SPPF -> C2PSA + Delta) | Row 2: Lateral Skip-P3 SAB (Pre, Post, Delta & Native 80x80)",
+        banner_title=b_title,
+        banner_sub=b_sub,
         colormap_id=colormap_id,
     )
 
@@ -1732,13 +1789,18 @@ def main() -> None:
             )
             cv2.imwrite(str(img_out_dir / "02_all_backbone_layers_160_to_20.png"), fig2)
 
-            # 4. Stage 4 (20x20) + Neck Skip-P3 SAB (80x80) Refinement
+            # 4. Stage 4 (20x20) Refinement (+ Neck Skip-P3 SAB if present)
             fig3 = build_skip_p3_and_stage4_figure(
                 ref_panel, records_a, proj_a, recorder_a.stage_slots, recorder_a.skip_p3_sab_mod,
                 args.imgsz, crop_box, colormap_id, args.alpha, args.clip_percentile, model_title,
             )
             if fig3 is not None:
-                cv2.imwrite(str(img_out_dir / "03_skip_p3_sab_and_stage4_20x20.png"), fig3)
+                fig3_name = (
+                    "03_skip_p3_sab_and_stage4_20x20.png"
+                    if recorder_a.skip_p3_sab_mod is not None
+                    else "03_stage4_c2psa_20x20.png"
+                )
+                cv2.imwrite(str(img_out_dir / fig3_name), fig3)
 
             # 5. Quantitative Activation & Learned Edge/SAB Parameter Chart
             fig4 = build_stats_chart(

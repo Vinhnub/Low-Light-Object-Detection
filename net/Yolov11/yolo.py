@@ -115,16 +115,15 @@ def get_yolov11_cfg_dict(
             [[-1, 7], 1, "Concat", [1]],                   # 13 cat backbone P4
             [-1, 2, "C3k2", [512, False]],                 # 14
             [-1, 1, "nn.Upsample", [None, 2, "nearest"]],  # 15
-            [5, 1, "SAB", [4, False, 2]],                  # 16 (Backbone P3/8 Skip SAB Transposed Attention before Concat)
-            [[15, -1], 1, "Concat", [1]],                  # 17 cat upsample P4 & attention-enriched backbone P3
-            [-1, 2, "C3k2", [256, False]],                 # 18 (FPN P3/8-small -> Detect P3 & PAN)
-            [-1, 1, "Conv", [256, 3, 2]],                  # 19 (PAN Down from P3)
-            [[-1, 14], 1, "Concat", [1]],                  # 20 cat head P4
-            [-1, 2, "C3k2", [512, False]],                 # 21 (P4/16-medium)
-            [-1, 1, "Conv", [512, 3, 2]],                  # 22 (PAN Down from P4)
-            [[-1, 11], 1, "Concat", [1]],                  # 23 cat head P5
-            [-1, 2, "C3k2", [1024, True]],                 # 24 (P5/32-large)
-            [[18, 21, 24], 1, "Detect", ["nc"]],           # 25 Detect(P3, P4, P5)
+            [[-1, 5], 1, "Concat", [1]],                   # 16 cat backbone P3
+            [-1, 2, "C3k2", [256, False]],                 # 17 (P3/8-small)
+            [-1, 1, "Conv", [256, 3, 2]],                  # 18
+            [[-1, 14], 1, "Concat", [1]],                  # 19 cat head P4
+            [-1, 2, "C3k2", [512, False]],                 # 20 (P4/16-medium)
+            [-1, 1, "Conv", [512, 3, 2]],                  # 21
+            [[-1, 11], 1, "Concat", [1]],                  # 22 cat head P5
+            [-1, 2, "C3k2", [1024, True]],                 # 23 (P5/32-large)
+            [[17, 20, 23], 1, "Detect", ["nc"]],           # 24 Detect(P3, P4, P5)
         ],
     }
 
@@ -1099,12 +1098,10 @@ class YOLOv11Neck(nn.Module):
         self.out_channels = (c3_out, c4_out, c5_out)
 
         # Top-down FPN pathway
-        self.upsample1 = nn.Upsample(scale_factor=2, mode="nearest")  # Layer 11
-        self.c3k2_p4 = C3k2(c5 + c4, c4_fpn, n=d(2), c3k=c3k_override)  # Layer 13
+        self.upsample1 = nn.Upsample(scale_factor=2, mode="nearest")  # Layer 12
+        self.c3k2_p4 = C3k2(c5 + c4, c4_fpn, n=d(2), c3k=c3k_override)  # Layer 14
 
-        self.upsample2 = nn.Upsample(scale_factor=2, mode="nearest")  # Layer 14
-        # Lateral Skip Transposed Self-Attention on Backbone P3/8 (L4) before FPN Concat
-        self.attn_p3 = SAB(c3, num_heads=num_heads, bias=False, reduction=2)  # Layer 15
+        self.upsample2 = nn.Upsample(scale_factor=2, mode="nearest")  # Layer 15
         self.c3k2_p3 = C3k2(c4_fpn + c3, c3_out, n=d(2), c3k=c3k_override)  # Layer 17 (N3/8)
 
         # Bottom-up PAN pathway
@@ -1120,10 +1117,9 @@ class YOLOv11Neck(nn.Module):
     ) -> List[torch.Tensor]:
         p3, p4, p5 = features
 
-        # Top-down FPN (SAB refines Backbone P3/8 lateral skip before Concat)
+        # Top-down FPN
         f_p4 = self.c3k2_p4(torch.cat([self.upsample1(p5), p4], dim=1))
-        p3_enh = self.attn_p3(p3)
-        n3 = self.c3k2_p3(torch.cat([self.upsample2(f_p4), p3_enh], dim=1))
+        n3 = self.c3k2_p3(torch.cat([self.upsample2(f_p4), p3], dim=1))
 
         # Bottom-up PAN
         n4 = self.c3k2_n4(torch.cat([self.down_p3(n3), f_p4], dim=1))
