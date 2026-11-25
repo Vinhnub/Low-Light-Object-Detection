@@ -343,14 +343,68 @@ def option():
         "--label_smoothing",
         type=float,
         default=0.0,
-        help="Label smoothing epsilon for classification BCE (default: 0.0)",
+        help="Label smoothing epsilon for foreground classification BCE (default: 0.0, 0.05 recommended for noisy GT)",
+    )
+    parser.add_argument(
+        "--cls_pw",
+        type=float,
+        default=1.0,
+        help="Positive class weight in BCE (>1.0 penalizes false negatives more to boost recall, default: 1.0)",
+    )
+    parser.add_argument(
+        "--rce_weight",
+        type=float,
+        default=0.0,
+        help="Symmetric BCE Reverse Cross-Entropy weight |p - y| for noisy class labels (default: 0.0, 0.1 recommended)",
+    )
+    parser.add_argument(
+        "--neg_margin",
+        type=float,
+        default=0.0,
+        help="Asymmetric probability margin shift on background negatives p_m = max(p - m, 0) (default: 0.0, 0.03-0.05 recommended)",
+    )
+    parser.add_argument(
+        "--neg_gamma",
+        type=float,
+        default=0.0,
+        help="Asymmetric negative focusing exponent on background negatives (default: 0.0, 1.0-1.5 recommended)",
+    )
+    parser.add_argument(
+        "--neg_blur_tau",
+        type=float,
+        default=1.0,
+        help="High-confidence negative suppression threshold tau (>=1.0 disables, 0.70-0.75 forgives missing/out-of-class objects)",
+    )
+    parser.add_argument(
+        "--neg_blur_alpha",
+        type=float,
+        default=0.10,
+        help="Exponential decay temperature alpha for high-confidence negative blur exp(-(p - tau)/alpha) (default: 0.10)",
+    )
+    parser.add_argument(
+        "--blur_warmup_epochs",
+        type=int,
+        default=15,
+        help="Initial warmup epochs before enabling high-confidence negative blur (default: 15)",
     )
     parser.add_argument(
         "--iou_type",
         type=str,
         default="ciou",
-        choices=["ciou", "diou", "giou", "eiou", "siou"],
-        help="IoU loss formulation for bounding box regression (default: ciou)",
+        choices=["ciou", "diou", "giou", "eiou", "siou", "wiou"],
+        help="IoU loss formulation for bounding box regression: ciou/diou/giou/eiou/siou/wiou (default: ciou)",
+    )
+    parser.add_argument(
+        "--wiou_alpha",
+        type=float,
+        default=1.9,
+        help="Wise-IoU v3 non-monotonic focusing alpha parameter (default: 1.9)",
+    )
+    parser.add_argument(
+        "--wiou_delta",
+        type=float,
+        default=3.0,
+        help="Wise-IoU v3 outlier threshold delta for suppressing noisy GT boxes (default: 3.0)",
     )
 
     # 5. Data Augmentation & Low-Light Enhancement Curve settings

@@ -5,6 +5,7 @@ Unified exports for YOLOv5, YOLOv11, and YOLOv26 detection losses & utilities.
 
 from loss.loss_utils import (
     BCEBlurWithLogitsLoss,
+    BlurredAsymmetricBCELoss,
     FocalLoss,
     QFocalLoss,
     bbox_iou,
@@ -46,6 +47,7 @@ __all__ = [
     "E2EDetectLoss",
     "bbox_iou",
     "smooth_BCE",
+    "BlurredAsymmetricBCELoss",
     "FocalLoss",
     "QFocalLoss",
     "BCEBlurWithLogitsLoss",

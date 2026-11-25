@@ -616,9 +616,18 @@ if __name__ == "__main__":
         f.write(f"batch size: {opt.batchSize}\n")
         f.write(f"img size: {opt.imgSize}\n")
         f.write(f"iou_type: {opt.iou_type}\n")
+        if opt.iou_type == "wiou":
+            f.write(f"wiou_alpha: {opt.wiou_alpha} | wiou_delta: {opt.wiou_delta}\n")
         f.write(f"box_weight: {opt.box_weight}\n")
         f.write(f"obj_weight: {opt.obj_weight} | dfl_weight: {opt.dfl_weight}\n")
-        f.write(f"cls_weight: {opt.cls_weight}\n")
+        f.write(
+            f"cls_weight: {opt.cls_weight} | cls_pw: {opt.cls_pw} | "
+            f"label_smoothing: {opt.label_smoothing} | rce_weight: {opt.rce_weight}\n"
+        )
+        f.write(
+            f"neg_margin: {opt.neg_margin} | neg_gamma: {opt.neg_gamma} | "
+            f"neg_blur_tau: {opt.neg_blur_tau} (alpha={opt.neg_blur_alpha}, warmup={opt.blur_warmup_epochs})\n"
+        )
         f.write(f"mosaic: {opt.mosaic} | gamma: {opt.gamma}\n\n")
         f.write(
             f"| Epochs | Total Loss | Box | {aux_header} | Cls | Precision | Recall | mAP@0.50 | mAP@0.75 | mAP@50:95 | lr | Note |\n"

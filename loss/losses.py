@@ -6,6 +6,7 @@ Includes:
   - YOLOv5: `YOLOv5DetectionLoss`, `YOLOv5BoxLoss`, `YOLOv5ObjLoss`, `YOLOv5ClsLoss`
   - YOLOv11: `TaskAlignedAssigner`, `DFLoss`, `BboxLoss`, `YOLOv11DetectionLoss` (`v8DetectionLoss`)
   - YOLOv26: `YOLOv26DetectionLoss` (`E2ELoss`, `E2EDetectLoss`) with one2many/one2one decay schedule
+  - Group 1 Low-Light Noise-Tolerant Losses: `BlurredAsymmetricBCELoss`, `smooth_BCE`, `Symmetric RCE`, `Wise-IoU v3`
   - Unified `ComputeLoss` auto-dispatching based on model head architecture
 """
 
@@ -17,6 +18,7 @@ import torch.nn.functional as F
 
 from loss.loss_utils import (
     BCEBlurWithLogitsLoss,
+    BlurredAsymmetricBCELoss,
     FocalLoss,
     QFocalLoss,
     bbox_iou,
@@ -27,21 +29,39 @@ from net.Yolov11.utils import bbox2dist, dist2bbox, make_anchors, xywh2xyxy
 
 # Default YOLOv5 hyperparameters (hyp.scratch-low.yaml)
 DEFAULT_HYP: Dict[str, float] = {
-    "box": 0.05,            # box loss gain
-    "cls": 0.5,             # cls loss gain
-    "cls_pw": 1.0,          # cls BCELoss positive_weight
-    "obj": 1.0,             # obj loss gain (scale with pixels)
-    "obj_pw": 1.0,          # obj BCELoss positive_weight
-    "anchor_t": 4.0,        # anchor-multiple threshold
-    "fl_gamma": 0.0,        # focal loss gamma
-    "label_smoothing": 0.0, # label smoothing epsilon
+    "box": 0.05,                # box loss gain
+    "cls": 0.5,                 # cls loss gain
+    "cls_pw": 1.0,              # cls BCELoss positive_weight
+    "obj": 1.0,                 # obj loss gain (scale with pixels)
+    "obj_pw": 1.0,              # obj BCELoss positive_weight
+    "anchor_t": 4.0,            # anchor-multiple threshold
+    "fl_gamma": 0.0,            # focal loss gamma
+    "label_smoothing": 0.0,     # label smoothing epsilon
+    "rce_weight": 0.0,          # Symmetric BCE Reverse Cross-Entropy weight
+    "neg_margin": 0.0,          # Asymmetric probability margin shift on background
+    "neg_gamma": 0.0,           # Asymmetric negative focusing exponent
+    "neg_blur_tau": 1.0,        # High-confidence negative blur threshold (>=1.0 disables)
+    "neg_blur_alpha": 0.10,     # High-confidence negative blur decay temperature
+    "blur_warmup_epochs": 15.0, # Warmup epochs before activating high-conf negative blur
+    "wiou_alpha": 1.9,          # Wise-IoU v3 alpha
+    "wiou_delta": 3.0,          # Wise-IoU v3 delta
 }
 
-# Default YOLOv11 / YOLOv26 hyperparameters (Ultralytics default.yaml)
+# Default YOLOv11 / YOLOv26 hyperparameters (Ultralytics default.yaml + Group 1 extensions)
 DEFAULT_V11_HYP: Dict[str, float] = {
-    "box": 7.5,             # box loss gain
-    "cls": 0.5,             # cls loss gain
-    "dfl": 1.5,             # dfl / l1 box regression loss gain
+    "box": 7.5,                 # box loss gain
+    "cls": 0.5,                 # cls loss gain
+    "dfl": 1.5,                 # dfl / l1 box regression loss gain
+    "cls_pw": 1.0,              # cls positive_weight (>1.0 boosts recall)
+    "label_smoothing": 0.0,     # foreground label smoothing epsilon
+    "rce_weight": 0.0,          # Symmetric BCE Reverse Cross-Entropy weight
+    "neg_margin": 0.0,          # Asymmetric probability margin shift on background
+    "neg_gamma": 0.0,           # Asymmetric negative focusing exponent
+    "neg_blur_tau": 1.0,        # High-confidence negative blur threshold (>=1.0 disables)
+    "neg_blur_alpha": 0.10,     # High-confidence negative blur decay temperature
+    "blur_warmup_epochs": 15.0, # Warmup epochs before activating high-conf negative blur
+    "wiou_alpha": 1.9,          # Wise-IoU v3 alpha
+    "wiou_delta": 3.0,          # Wise-IoU v3 delta
 }
 
 
@@ -63,12 +83,24 @@ def _get_detect_head(model: nn.Module) -> nn.Module:
 
 
 def _resolve_v11_hyp(hyp: Optional[Union[Dict[str, Any], Any]] = None) -> Dict[str, float]:
-    """Extract YOLOv11/YOLOv26 loss gains from dict or argparse Namespace."""
+    """Extract YOLOv11/YOLOv26 loss gains & Group 1 noise-tolerant parameters from dict or Namespace."""
     h = dict(DEFAULT_V11_HYP)
     if hyp is None:
         return h
+    extra_keys = (
+        "cls_pw",
+        "label_smoothing",
+        "rce_weight",
+        "neg_margin",
+        "neg_gamma",
+        "neg_blur_tau",
+        "neg_blur_alpha",
+        "blur_warmup_epochs",
+        "wiou_alpha",
+        "wiou_delta",
+    )
     if isinstance(hyp, dict):
-        for k in ("box", "cls", "dfl"):
+        for k in ("box", "cls", "dfl", *extra_keys):
             if hyp.get(k) is not None:
                 h[k] = float(hyp[k])
         return h
@@ -84,6 +116,9 @@ def _resolve_v11_hyp(hyp: Optional[Union[Dict[str, Any], Any]] = None) -> Dict[s
         h["dfl"] = float(hyp.dfl_weight)
     elif getattr(hyp, "dfl", None) is not None:
         h["dfl"] = float(hyp.dfl)
+    for k in extra_keys:
+        if getattr(hyp, k, None) is not None:
+            h[k] = float(getattr(hyp, k))
     return h
 
 
@@ -94,15 +129,24 @@ def _resolve_v11_hyp(hyp: Optional[Union[Dict[str, Any], Any]] = None) -> Dict[s
 class YOLOv5BoxLoss(nn.Module):
     """
     Standalone Bounding Box Regression Loss for YOLOv5.
-    Supports CIoU (default), DIoU, GIoU, EIoU, and SIoU.
+    Supports CIoU (default), DIoU, GIoU, EIoU, SIoU, and WIoU (v3).
     """
 
-    def __init__(self, iou_type: str = "ciou", loss_weight: float = 0.05):
+    def __init__(
+        self,
+        iou_type: str = "ciou",
+        loss_weight: float = 0.05,
+        wiou_alpha: float = 1.9,
+        wiou_delta: float = 3.0,
+    ):
         super().__init__()
         self.iou_type = iou_type.lower()
         self.loss_weight = loss_weight
-        if self.iou_type not in {"ciou", "diou", "giou", "eiou", "siou", "iou"}:
+        self.wiou_alpha = float(wiou_alpha)
+        self.wiou_delta = float(wiou_delta)
+        if self.iou_type not in {"ciou", "diou", "giou", "eiou", "siou", "wiou", "iou"}:
             raise ValueError(f"Unsupported iou_type: {iou_type}")
+        self.register_buffer("wiou_iou_mean", torch.tensor(1.0), persistent=False)
 
     def forward(
         self, pbox: torch.Tensor, tbox: torch.Tensor
@@ -116,6 +160,11 @@ class YOLOv5BoxLoss(nn.Module):
             GIoU=(self.iou_type == "giou"),
             EIoU=(self.iou_type == "eiou"),
             SIoU=(self.iou_type == "siou"),
+            WIoU=(self.iou_type == "wiou"),
+            wiou_iou_mean=self.wiou_iou_mean if self.iou_type == "wiou" else None,
+            update_wiou_mean=(self.training and self.iou_type == "wiou"),
+            wiou_alpha=self.wiou_alpha,
+            wiou_delta=self.wiou_delta,
         ).squeeze(-1)
         loss = (1.0 - iou).mean()
         return loss, iou
@@ -204,6 +253,20 @@ class YOLOv5DetectionLoss(nn.Module):
                     h["fl_gamma"] = float(hyp.fl_gamma)
                 if getattr(hyp, "label_smoothing", None) is not None:
                     h["label_smoothing"] = float(hyp.label_smoothing)
+                for k in (
+                    "cls_pw",
+                    "obj_pw",
+                    "rce_weight",
+                    "neg_margin",
+                    "neg_gamma",
+                    "neg_blur_tau",
+                    "neg_blur_alpha",
+                    "blur_warmup_epochs",
+                    "wiou_alpha",
+                    "wiou_delta",
+                ):
+                    if getattr(hyp, k, None) is not None:
+                        h[k] = float(getattr(hyp, k))
                 if getattr(hyp, "iou_type", None) is not None:
                     iou_type = str(hyp.iou_type)
 
@@ -215,15 +278,46 @@ class YOLOv5DetectionLoss(nn.Module):
 
         self.hyp = h
         self.iou_type = iou_type.lower()
+        self.wiou_alpha = float(h.get("wiou_alpha", 1.9))
+        self.wiou_delta = float(h.get("wiou_delta", 3.0))
+        self.register_buffer("wiou_iou_mean", torch.tensor(1.0, device=device), persistent=False)
 
-        BCEcls = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h["cls_pw"]], device=device))
-        BCEobj = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h["obj_pw"]], device=device))
+        use_group1_bce = (
+            h.get("rce_weight", 0.0) > 0.0
+            or h.get("neg_margin", 0.0) > 0.0
+            or h.get("neg_gamma", 0.0) > 0.0
+            or h.get("neg_blur_tau", 1.0) < 1.0
+        )
 
         self.cp, self.cn = smooth_BCE(eps=h.get("label_smoothing", 0.0))
 
         g = h["fl_gamma"]
         if g > 0:
-            BCEcls, BCEobj = FocalLoss(BCEcls, g), FocalLoss(BCEobj, g)
+            BCEcls = FocalLoss(
+                nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h["cls_pw"]], device=device)), g
+            )
+            BCEobj = FocalLoss(
+                nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h["obj_pw"]], device=device)), g
+            )
+        elif use_group1_bce:
+            BCEcls = BlurredAsymmetricBCELoss(
+                pos_weight=h["cls_pw"],
+                rce_weight=h["rce_weight"],
+                reduction="mean",
+            ).to(device)
+            BCEobj = BlurredAsymmetricBCELoss(
+                pos_weight=h["obj_pw"],
+                rce_weight=h["rce_weight"],
+                neg_margin=h["neg_margin"],
+                neg_gamma=h["neg_gamma"],
+                neg_blur_tau=h["neg_blur_tau"],
+                neg_blur_alpha=h["neg_blur_alpha"],
+                blur_warmup_epochs=int(h["blur_warmup_epochs"]),
+                reduction="mean",
+            ).to(device)
+        else:
+            BCEcls = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h["cls_pw"]], device=device))
+            BCEobj = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h["obj_pw"]], device=device))
 
         self.balance = {3: [4.0, 1.0, 0.4]}.get(m.nl, [4.0, 1.0, 0.25, 0.06, 0.02])
         self.ssi = list(m.stride).index(16) if autobalance else 0
@@ -237,6 +331,21 @@ class YOLOv5DetectionLoss(nn.Module):
         self.nl = m.nl
         self.anchors = m.anchors
         self.device = device
+        self.updates = 0
+
+    def update(self) -> None:
+        """Advance epoch counter for warmup-gated negative blur."""
+        self.updates += 1
+        for m_bce in (self.BCEcls, self.BCEobj):
+            if hasattr(m_bce, "update"):
+                m_bce.update()
+
+    def sync_updates(self, completed_epochs: int) -> None:
+        """Synchronize epoch counter when resuming training."""
+        self.updates = max(int(completed_epochs), 0)
+        for m_bce in (self.BCEcls, self.BCEobj):
+            if hasattr(m_bce, "sync_updates"):
+                m_bce.sync_updates(completed_epochs)
 
     def __call__(
         self,
@@ -272,10 +381,15 @@ class YOLOv5DetectionLoss(nn.Module):
                     GIoU=(self.iou_type == "giou"),
                     EIoU=(self.iou_type == "eiou"),
                     SIoU=(self.iou_type == "siou"),
+                    WIoU=(self.iou_type == "wiou"),
+                    wiou_iou_mean=self.wiou_iou_mean if self.iou_type == "wiou" else None,
+                    update_wiou_mean=(self.training and self.iou_type == "wiou"),
+                    wiou_alpha=self.wiou_alpha,
+                    wiou_delta=self.wiou_delta,
                 ).squeeze(-1)
                 lbox += (1.0 - iou).mean()
 
-                iou = iou.detach().clamp(0).type(tobj.dtype)
+                iou = iou.detach().clamp(0, 1.0).type(tobj.dtype)
                 if self.sort_obj_iou:
                     j = iou.argsort()
                     b, a, gj, gi, iou = b[j], a[j], gj[j], gi[j], iou[j]
@@ -286,7 +400,11 @@ class YOLOv5DetectionLoss(nn.Module):
                 if self.nc > 1:
                     t = torch.full_like(pcls, self.cn, device=device)
                     t[range(n), tcls[i]] = self.cp
-                    lcls += self.BCEcls(pcls, t)
+                    if isinstance(self.BCEcls, BlurredAsymmetricBCELoss):
+                        fg_all = torch.ones(n, dtype=torch.bool, device=device)
+                        lcls += self.BCEcls(pcls, t, fg_mask=fg_all)
+                    else:
+                        lcls += self.BCEcls(pcls, t)
 
             obji = self.BCEobj(pi[..., 4], tobj)
             lobj += obji * self.balance[i]
@@ -608,13 +726,22 @@ class DFLoss(nn.Module):
 
 
 class BboxLoss(nn.Module):
-    """Bounding Box CIoU + DFL (YOLOv11) / normalized L1 (YOLOv26 `reg_max=1`) loss."""
+    """Bounding Box IoU/WIoU + DFL (YOLOv11) / normalized L1 (YOLOv26 `reg_max=1`) loss."""
 
-    def __init__(self, reg_max: int = 16, iou_type: str = "ciou"):
+    def __init__(
+        self,
+        reg_max: int = 16,
+        iou_type: str = "ciou",
+        wiou_alpha: float = 1.9,
+        wiou_delta: float = 3.0,
+    ):
         super().__init__()
         self.reg_max = reg_max
         self.iou_type = iou_type.lower()
+        self.wiou_alpha = float(wiou_alpha)
+        self.wiou_delta = float(wiou_delta)
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
+        self.register_buffer("wiou_iou_mean", torch.tensor(1.0), persistent=False)
 
     def forward(
         self,
@@ -638,6 +765,11 @@ class BboxLoss(nn.Module):
             GIoU=(self.iou_type == "giou"),
             EIoU=(self.iou_type == "eiou"),
             SIoU=(self.iou_type == "siou"),
+            WIoU=(self.iou_type == "wiou"),
+            wiou_iou_mean=self.wiou_iou_mean if self.iou_type == "wiou" else None,
+            update_wiou_mean=(self.training and self.iou_type == "wiou"),
+            wiou_alpha=self.wiou_alpha,
+            wiou_delta=self.wiou_delta,
         )
         loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
 
@@ -677,7 +809,8 @@ class BboxLoss(nn.Module):
 class YOLOv11DetectionLoss(nn.Module):
     """
     Ultralytics YOLOv8/YOLOv11 Detection Loss (`v8DetectionLoss`).
-    Uses TaskAlignedAssigner + CIoU + DFL (or L1 when `reg_max == 1`) + BCE.
+    Uses TaskAlignedAssigner + IoU/WIoU + DFL (or L1 when `reg_max == 1`) +
+    Group 1 Noise-Tolerant Blurred Asymmetric/Symmetric BCE + Label Smoothing.
     """
 
     loss_names: Tuple[str, str, str] = ("box", "dfl", "cls")
@@ -694,8 +827,26 @@ class YOLOv11DetectionLoss(nn.Module):
         device = next(model.parameters()).device
         m = _get_detect_head(model)
 
+        if hyp is not None and not isinstance(hyp, dict) and getattr(hyp, "iou_type", None):
+            iou_type = str(hyp.iou_type)
+        elif isinstance(hyp, dict) and hyp.get("iou_type") is not None:
+            iou_type = str(hyp["iou_type"])
+
         self.hyp = _resolve_v11_hyp(hyp)
-        self.bce = nn.BCEWithLogitsLoss(reduction="none")
+        self.label_smoothing = float(self.hyp.get("label_smoothing", 0.0))
+        self.cp, self.cn = smooth_BCE(eps=self.label_smoothing)
+
+        self.bce = BlurredAsymmetricBCELoss(
+            pos_weight=self.hyp.get("cls_pw", 1.0),
+            rce_weight=self.hyp.get("rce_weight", 0.0),
+            neg_margin=self.hyp.get("neg_margin", 0.0),
+            neg_gamma=self.hyp.get("neg_gamma", 0.0),
+            neg_blur_tau=self.hyp.get("neg_blur_tau", 1.0),
+            neg_blur_alpha=self.hyp.get("neg_blur_alpha", 0.10),
+            blur_warmup_epochs=int(self.hyp.get("blur_warmup_epochs", 15)),
+            reduction="none",
+        ).to(device)
+
         self.stride = m.stride.to(device)
         self.nc = m.nc
         self.no = m.nc + m.reg_max * 4
@@ -712,8 +863,24 @@ class YOLOv11DetectionLoss(nn.Module):
             beta=6.0,
             topk2=tal_topk2,
         )
-        self.bbox_loss = BboxLoss(m.reg_max, iou_type=iou_type).to(device)
+        self.bbox_loss = BboxLoss(
+            m.reg_max,
+            iou_type=iou_type,
+            wiou_alpha=self.hyp.get("wiou_alpha", 1.9),
+            wiou_delta=self.hyp.get("wiou_delta", 3.0),
+        ).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
+        self.updates = 0
+
+    def update(self) -> None:
+        """Advance epoch counter once per epoch for warmup-gated negative blur."""
+        self.updates += 1
+        self.bce.update()
+
+    def sync_updates(self, completed_epochs: int) -> None:
+        """Synchronize epoch counter when resuming from an existing epoch."""
+        self.updates = max(int(completed_epochs), 0)
+        self.bce.sync_updates(completed_epochs)
 
     def preprocess(
         self,
@@ -801,8 +968,20 @@ class YOLOv11DetectionLoss(nn.Module):
         target_scores_sum = max(target_scores.sum(), 1)
         loss = torch.zeros(3, device=device)
 
-        # Cls loss
-        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
+        # Cls loss (with optional foreground label smoothing + Group 1 Asymmetric/Blurred/Symmetric BCE)
+        if self.label_smoothing > 0.0:
+            fg_quality = target_scores.sum(dim=-1, keepdim=True)
+            if self.nc > 1:
+                cls_targets = target_scores * (self.cp - self.cn) + fg_quality * self.cn
+            else:
+                cls_targets = target_scores * self.cp
+        else:
+            cls_targets = target_scores
+
+        loss[1] = (
+            self.bce(pred_scores, cls_targets.to(dtype), fg_mask=fg_mask).sum()
+            / target_scores_sum
+        )
 
         # Box & DFL/L1 loss
         if fg_mask.sum():
@@ -864,18 +1043,22 @@ class YOLOv26DetectionLoss(nn.Module):
         self.o2o = 1.0 - self.o2m
 
     def update(self) -> None:
-        """Advance decay schedule once per epoch (`o2m`: 0.8 -> 0.1, `o2o`: 0.2 -> 0.9)."""
+        """Advance decay schedule & warmup counters once per epoch (`o2m`: 0.8 -> 0.1, `o2o`: 0.2 -> 0.9)."""
         self.updates += 1
         progress = min(self.updates / self.total_updates, 1.0)
         self.o2m = self.initial_o2m - (self.initial_o2m - self.final_o2m) * progress
         self.o2o = 1.0 - self.o2m
+        self.one2many.update()
+        self.one2one.update()
 
     def sync_updates(self, completed_epochs: int) -> None:
-        """Synchronize decay schedule when resuming from an existing epoch."""
+        """Synchronize decay schedule & warmup counters when resuming from an existing epoch."""
         self.updates = max(int(completed_epochs), 0)
         progress = min(self.updates / self.total_updates, 1.0)
         self.o2m = self.initial_o2m - (self.initial_o2m - self.final_o2m) * progress
         self.o2o = 1.0 - self.o2m
+        self.one2many.sync_updates(completed_epochs)
+        self.one2one.sync_updates(completed_epochs)
 
     def forward(
         self,
