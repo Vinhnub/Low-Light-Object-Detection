@@ -100,7 +100,7 @@ def get_yolov11_cfg_dict(
             [-1, 1, "Conv", [64, 3, 2]],               # 0-P1/2
             [-1, 1, "Conv", [128, 3, 2]],              # 1-P2/4
             [-1, 2, "C3k2", [256, False, 0.25]],       # 2-P2/4
-            [-1, 1, "EdgeSAB", [4, False, 2]],         # 3-P2/4 (160x160 Edge-Guided SAB, gamma=0.1, edge_scale=2.0)
+            [-1, 1, "SAB", [4, False, 2]],             # 3-P2/4 (160x160 Pure Transposed SAB, gamma=0.1, no Edge)
             [-1, 1, "Conv", [256, 3, 2]],              # 4-P3/8
             [-1, 2, "C3k2", [512, False, 0.25]],       # 5-P3/8
             [-1, 1, "Conv", [512, 3, 2]],              # 6-P4/16
@@ -1034,9 +1034,9 @@ class YOLOv11Backbone(nn.Module):
             Conv(c(64), c(128), k=3, s=2),
             C3k2(c(128), c(256), n=d(2), c3k=c3k_override, e=0.25),
         )
-        # Layer 3: P2/4 (160x160) Edge-Guided Self-Attention
-        self.attn_p2 = EdgeSAB(
-            c(256), num_heads=4, bias=False, reduction=2, gamma_init=0.1, edge_scale_init=2.0
+        # Layer 3: P2/4 (160x160) Pure Transposed Self-Attention (no Edge)
+        self.attn_p2 = SAB(
+            c(256), num_heads=4, bias=False, reduction=2, gamma_init=0.1
         )
 
         # Layer 4-5: P3/8
@@ -1060,11 +1060,11 @@ class YOLOv11Backbone(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor, edge_map: Optional[torch.Tensor] = None
+        self, x: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x = self.stem(x)                          # P1/2
         x = self.stage1(x)                        # P2/4
-        x = self.attn_p2(x, edge_map=edge_map)    # P2/4 EdgeSAB
+        x = self.attn_p2(x)                       # P2/4 Pure SAB
         p3 = self.stage2(x)                       # P3/8
         p4 = self.stage3(p3)                      # P4/16
         p5 = self.stage4(p4)                      # P5/32
@@ -1158,7 +1158,7 @@ class YOLOv11(nn.Module):
         self.names = [str(i) for i in range(num_classes)]
         self.inplace = inplace
 
-        self.edge_extractor = EdgeExtractor(in_channels=in_channels, rgb_to_gray=(in_channels == 3))
+        self.edge_extractor = None
         self.backbone = YOLOv11Backbone(
             in_channels=in_channels,
             depth_multiple=depth_multiple,
@@ -1205,14 +1205,12 @@ class YOLOv11(nn.Module):
     def extract_features(
         self, x: torch.Tensor
     ) -> Tuple[Tuple[torch.Tensor, ...], List[torch.Tensor]]:
-        edge_map = self.edge_extractor(x)
-        backbone_feats = self.backbone(x, edge_map=edge_map)
+        backbone_feats = self.backbone(x)
         neck_feats = self.neck(backbone_feats)
         return backbone_feats, neck_feats
 
     def forward(self, x: torch.Tensor):
-        edge_map = self.edge_extractor(x)
-        p3, p4, p5 = self.backbone(x, edge_map=edge_map)
+        p3, p4, p5 = self.backbone(x)
         neck_feats = self.neck((p3, p4, p5))
         return self.head(neck_feats)
 

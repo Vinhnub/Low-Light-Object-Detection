@@ -745,6 +745,7 @@ class SAB(nn.Module):
         bias: bool = False,
         reduction: int = 2,
         kv_dim: Optional[int] = None,
+        gamma_init: float = 0.1,
     ):
         super().__init__()
         inner_dim = max(dim // max(reduction, 1), num_heads)
@@ -759,7 +760,7 @@ class SAB(nn.Module):
         self.num_heads = num_heads
         self.head_dim = inner_dim // num_heads
         self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
-        self.gamma = nn.Parameter(torch.full((1, dim, 1, 1), 0.5))
+        self.gamma = nn.Parameter(torch.full((1, dim, 1, 1), float(gamma_init)))
 
         self.q = nn.Conv2d(dim, inner_dim, kernel_size=1, bias=bias)
         self.q_dwconv = nn.Conv2d(

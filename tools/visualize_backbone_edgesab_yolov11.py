@@ -178,8 +178,8 @@ def parse_args() -> argparse.Namespace:
         "--arch",
         type=str,
         default="auto",
-        choices=["auto", "p2_edgesab", "p2_edgesab_skip_p3", "skip_p3_sab", "skip_p3_edgesab", "base"],
-        help="Architecture variant ('auto' matches each checkpoint exactly, or 25L p2_edgesab for 'auto'/'none' weights).",
+        choices=["auto", "p2_sab", "p2_edgesab", "p2_edgesab_skip_p3", "skip_p3_sab", "skip_p3_edgesab", "base"],
+        help="Architecture variant ('auto' matches each checkpoint exactly, or 25L p2_sab for 'auto'/'none' weights).",
     )
     parser.add_argument(
         "--source",
@@ -368,7 +368,9 @@ def detect_ckpt_arch(ckpt_meta: Any) -> Optional[str]:
     if _has_detect(25) and _has_sab(3):
         return "p2_edgesab_skip_p3"
     if _has_detect(24) and _has_sab(3):
-        return "p2_edgesab"
+        if any(k.startswith("model.3.edge_gate.") for k in keys):
+            return "p2_edgesab"
+        return "p2_sab"
     if _has_detect(24) and _has_sab(15):
         if any(k.startswith("model.15.edge_gate.") for k in keys):
             return "skip_p3_edgesab"
@@ -381,7 +383,7 @@ def detect_ckpt_arch(ckpt_meta: Any) -> Optional[str]:
 def _build_legacy_cfg_dict(model_name: str, nc: int, arch: str) -> Dict[str, Any]:
     variant = model_name.lower().replace("yolov11", "").replace("yolo11", "")
     scales = {k: list(v) for k, v in YOLOV11_SCALES.items()}
-    if arch == "p2_edgesab_skip_p3":
+    if arch in {"p2_edgesab", "p2_edgesab_skip_p3"}:
         backbone_p2 = [
             [-1, 1, "Conv", [64, 3, 2]],
             [-1, 1, "Conv", [128, 3, 2]],
@@ -396,6 +398,23 @@ def _build_legacy_cfg_dict(model_name: str, nc: int, arch: str) -> Dict[str, Any
             [-1, 1, "SPPF", [1024, 5]],
             [-1, 2, "C2PSA", [1024]],
         ]
+        if arch == "p2_edgesab":
+            head_25 = [
+                [-1, 1, "nn.Upsample", [None, 2, "nearest"]],
+                [[-1, 7], 1, "Concat", [1]],
+                [-1, 2, "C3k2", [512, False]],
+                [-1, 1, "nn.Upsample", [None, 2, "nearest"]],
+                [[-1, 5], 1, "Concat", [1]],
+                [-1, 2, "C3k2", [256, False]],
+                [-1, 1, "Conv", [256, 3, 2]],
+                [[-1, 14], 1, "Concat", [1]],
+                [-1, 2, "C3k2", [512, False]],
+                [-1, 1, "Conv", [512, 3, 2]],
+                [[-1, 11], 1, "Concat", [1]],
+                [-1, 2, "C3k2", [1024, True]],
+                [[17, 20, 23], 1, "Detect", ["nc"]],
+            ]
+            return {"nc": nc, "scale": variant, "scales": scales, "backbone": backbone_p2, "head": head_25}
         head_26 = [
             [-1, 1, "nn.Upsample", [None, 2, "nearest"]],
             [[-1, 7], 1, "Concat", [1]],
@@ -516,11 +535,11 @@ def load_yolov11_model(
         detected = detect_ckpt_arch(ckpt_meta) if ckpt_meta is not None else None
         resolved_arch = (
             detected
-            if detected in {"base", "skip_p3_sab", "skip_p3_edgesab", "p2_edgesab", "p2_edgesab_skip_p3"}
-            else "p2_edgesab"
+            if detected in {"base", "skip_p3_sab", "skip_p3_edgesab", "p2_sab", "p2_edgesab", "p2_edgesab_skip_p3"}
+            else "p2_sab"
         )
 
-    if cfg_path is not None or is_modular or resolved_arch == "p2_edgesab":
+    if cfg_path is not None or is_modular or resolved_arch == "p2_sab":
         model = build_yolo_model(
             model_name=model_name,
             num_classes=nc,
@@ -672,6 +691,7 @@ class YOLOv11BackboneEdgeRecorder:
         self.handles: List[Any] = []
         self.records: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self.edge_extractor_mod: Optional[EdgeExtractor] = getattr(self.model, "edge_extractor", None)
+        self.p2_attn_mod: Optional[nn.Module] = None
         self.p2_edgesab_mod: Optional[EdgeSAB] = None
         self.p2_edgesab_input: Optional[torch.Tensor] = None
         self.skip_p3_sab_mod: Optional[nn.Module] = None
@@ -708,15 +728,16 @@ class YOLOv11BackboneEdgeRecorder:
     def _register(self) -> None:
         if hasattr(self.model, "model") and isinstance(self.model.model, nn.Sequential):
             layers = list(self.model.model)
-            has_p2_edgesab = len(layers) > 3 and isinstance(layers[3], EdgeSAB)
+            has_p2_attn = len(layers) > 3 and isinstance(layers[3], (SAB, EdgeSAB))
 
-            if has_p2_edgesab:
-                # 26-layer P2-EdgeSAB + Skip-P3-SAB architecture
+            if has_p2_attn:
+                is_edge_p2 = isinstance(layers[3], EdgeSAB)
+                p2_tag = "EdgeSAB" if is_edge_p2 else "SAB"
                 spec = [
                     (0, "L00_Stem_Conv3x3_P1_2", "P1/2 (Stem)", 2, "p1", True, "p1"),
                     (1, "L01_Conv3x3_P2_4", "P2/4 (Stage1)", 4, "p2", False, ""),
-                    (2, "L02_C3k2_P2_4_PreEdgeSAB", "P2/4 (Stage1)", 4, "p2", True, "p2_pre"),
-                    (3, "L03_EdgeSAB_P2_4_160", "P2/4 (EdgeSAB)", 4, "p2_edge", True, "p2"),
+                    (2, f"L02_C3k2_P2_4_Pre{p2_tag}", "P2/4 (Stage1)", 4, "p2", True, "p2_pre"),
+                    (3, f"L03_{p2_tag}_P2_4_160", f"P2/4 ({p2_tag})", 4, "p2_edge", True, "p2"),
                     (4, "L04_Conv3x3_P3_8", "P3/8 (Stage2)", 8, "p3", False, ""),
                     (5, "L05_C3k2_P3_8_SkipP3", "P3/8 (Stage2)", 8, "p3", True, "p3"),
                     (6, "L06_Conv3x3_P4_16", "P4/16 (Stage3)", 16, "p4", False, ""),
@@ -726,7 +747,9 @@ class YOLOv11BackboneEdgeRecorder:
                     (10, "L10_SPPF_P5_32", "P5/32 (Stage4)", 32, "p5", False, "s4_sppf"),
                     (11, "L11_C2PSA_P5_32_SkipP5", "P5/32 (Stage4)", 32, "p5", True, "p5"),
                 ]
-                self.p2_edgesab_mod = layers[3]
+                self.p2_attn_mod = layers[3]
+                if is_edge_p2:
+                    self.p2_edgesab_mod = layers[3]
                 if len(layers) > 16 and isinstance(layers[16], (SAB, EdgeSAB)):
                     spec.append((16, "L16_SAB_SkipP3_80", "Neck (Skip-P3 SAB)", 8, "p3_sab", True, "p3_sab"))
                     self.skip_p3_sab_mod = layers[16]
@@ -770,8 +793,12 @@ class YOLOv11BackboneEdgeRecorder:
                 (2, "L02_C3k2_P2_4_PreEdgeSAB", "P2/4 (Stage1)", 4, "p2", True, "p2_pre" if hasattr(bb, "attn_p2") else "p2", bb.stage1[1]),
             ]
             if hasattr(bb, "attn_p2"):
-                self.p2_edgesab_mod = bb.attn_p2
-                spec_mod.append((3, "L03_EdgeSAB_P2_4_160", "P2/4 (EdgeSAB)", 4, "p2_edge", True, "p2", bb.attn_p2))
+                is_edge_p2 = isinstance(bb.attn_p2, EdgeSAB)
+                p2_tag = "EdgeSAB" if is_edge_p2 else "SAB"
+                self.p2_attn_mod = bb.attn_p2
+                if is_edge_p2:
+                    self.p2_edgesab_mod = bb.attn_p2
+                spec_mod.append((3, f"L03_{p2_tag}_P2_4_160", f"P2/4 ({p2_tag})", 4, "p2_edge", True, "p2", bb.attn_p2))
             off = 1 if hasattr(bb, "attn_p2") else 0
             spec_mod.extend([
                 (3 + off, f"L{3+off:02d}_Conv3x3_P3_8", "P3/8 (Stage2)", 8, "p3", False, "", bb.stage2[0]),
@@ -1422,6 +1449,48 @@ def build_skip_p3_and_stage4_figure(
     )
 
 
+def build_p2_sab_figure(
+    ref_panel: np.ndarray,
+    rec_pre: Dict[str, Any],
+    proj_pre: Dict[str, Any],
+    rec_post: Dict[str, Any],
+    proj_post: Dict[str, Any],
+    p2_sab_mod: nn.Module,
+    lb_size: int,
+    crop_box: Tuple[int, int, int, int],
+    colormap_id: int,
+    alpha: float,
+    clip_pct: float,
+    model_title: str,
+) -> np.ndarray:
+    """Create `01_p2_sab_refinement_160x160.png` for pure Backbone P2 SAB (without EdgeExtractor)."""
+    ov_pre, _, nat_pre = render_views_for_map(
+        ref_panel, proj_pre["l2"], lb_size, crop_box, colormap_id, alpha=alpha, clip_percentile=clip_pct
+    )
+    ov_post, _, nat_post = render_views_for_map(
+        ref_panel, proj_post["l2"], lb_size, crop_box, colormap_id, alpha=alpha, clip_percentile=clip_pct
+    )
+    delta_l2 = torch.sqrt(((rec_post["tensor"][0] - rec_pre["tensor"][0]) ** 2).mean(dim=0) + 1e-12).numpy()
+    ov_delta, _, _ = render_views_for_map(
+        ref_panel, delta_l2, lb_size, crop_box, colormap_id, alpha=0.58, clip_percentile=clip_pct
+    )
+    g_p2 = float(p2_sab_mod.gamma.detach().float().mean().item()) if hasattr(p2_sab_mod, "gamma") else 0.0
+    tiles = [
+        make_labeled_tile(ov_pre, f"1. Pre-SAB (L{rec_pre['layer_idx']:02d} C3k2)", f"160x160 | L2={proj_pre['l2_mean']:.4f} | Max={proj_pre['max_val']:.2f}", STAGE_ACCENT_BGR["p2"]),
+        make_labeled_tile(ov_post, f"2. Post-SAB (L{rec_post['layer_idx']:02d} SAB)", f"160x160 | L2={proj_post['l2_mean']:.4f} | gamma={g_p2:.3f}", STAGE_ACCENT_BGR["p2_edge"]),
+        make_labeled_tile(ov_delta, "3. P2-SAB Residual |L03 - L02|", f"160x160 | Mean Delta L2={float(delta_l2.mean()):.4f}", (60, 220, 255)),
+        make_labeled_tile(nat_pre, "4. Pre-SAB Native 160x160", f"Sparsity={proj_pre['sparsity']:.1f}%", STAGE_ACCENT_BGR["p2"]),
+        make_labeled_tile(nat_post, "5. Post-SAB Native 160x160", f"Sparsity={proj_post['sparsity']:.1f}%", STAGE_ACCENT_BGR["p2_edge"]),
+    ]
+    return assemble_grid(
+        tiles,
+        ncols=5,
+        banner_title=f"Backbone P2 Pure SAB (160x160) Refinement — {model_title}",
+        banner_sub="Pre-SAB (L02) -> Post-SAB (L03) -> Residual Delta |L03 - L02| -> Native 160x160 Grids",
+        colormap_id=colormap_id,
+    )
+
+
 def build_stats_chart(
     records: "OrderedDict[str, Dict[str, Any]]",
     projections: Dict[str, Dict[str, Any]],
@@ -1429,6 +1498,7 @@ def build_stats_chart(
     edgesab_info: Optional[Dict[str, Any]],
     skip_p3_sab_mod: Optional[nn.Module],
     model_title: str,
+    p2_attn_mod: Optional[nn.Module] = None,
 ) -> np.ndarray:
     rows_data: List[Tuple[str, str, float, float, float, Tuple[int, int, int]]] = []
     if edge_info is not None:
@@ -1463,7 +1533,8 @@ def build_stats_chart(
 
     cv2.rectangle(canvas, (0, 0), (width - 1, 62), (28, 30, 36), -1)
     cv2.line(canvas, (0, 62), (width - 1, 62), (80, 155, 255), 2)
-    title_txt = f"YOLOv11 Backbone + EdgeSAB Quantitative Diagnostics — {model_title}"
+    diag_tag = "EdgeSAB" if (edge_info is not None or edgesab_info is not None) else ("P2-SAB" if p2_attn_mod is not None else "Feature")
+    title_txt = f"YOLOv11 Backbone + {diag_tag} Quantitative Diagnostics — {model_title}"
     t_scale = min(0.58, max(0.42, (width - 40) / max(1, len(title_txt) * 13.0)))
     cv2.putText(canvas, title_txt, (16, 28), cv2.FONT_HERSHEY_SIMPLEX, t_scale, (245, 248, 255), 2, cv2.LINE_AA)
 
@@ -1472,6 +1543,9 @@ def build_stats_chart(
         param_parts.append(f"EdgeExtractor(weber_alpha={edge_info['weber_alpha']:.2f}, scale={edge_info['scale']:.2f}, offset={edge_info['offset']:.2f})")
     if edgesab_info is not None:
         param_parts.append(f"P2-EdgeSAB(gamma={edgesab_info['gamma_mean']:.3f}, edge_scale={edgesab_info['edge_scale']:.2f})")
+    elif p2_attn_mod is not None and hasattr(p2_attn_mod, "gamma"):
+        g_p2 = float(p2_attn_mod.gamma.detach().float().mean().item())
+        param_parts.append(f"P2-SAB(gamma={g_p2:.3f})")
     if skip_p3_sab_mod is not None and hasattr(skip_p3_sab_mod, "gamma"):
         g_sp3 = float(skip_p3_sab_mod.gamma.detach().float().mean().item())
         if hasattr(skip_p3_sab_mod, "edge_scale"):
@@ -1769,10 +1843,10 @@ def main() -> None:
             )
             cv2.imwrite(str(img_out_dir / "00_backbone_pyramid_160_to_20.png"), fig0)
 
-            # 2. Dedicated EdgeExtractor + P2 EdgeSAB (160x160) Deep Diagnostics
+            # 2. Dedicated EdgeExtractor + P2 EdgeSAB (or Pure P2 SAB) Diagnostics
+            pre_k = recorder_a.stage_slots.get("p2_pre", "")
+            post_k = recorder_a.stage_slots.get("p2", "")
             if edge_info_a is not None:
-                pre_k = recorder_a.stage_slots.get("p2_pre", "")
-                post_k = recorder_a.stage_slots.get("p2", "")
                 fig1 = build_edge_and_p2_edgesab_figure(
                     raw_panel, ref_panel, edge_info_a, edgesab_info_a,
                     records_a.get(pre_k), proj_a.get(pre_k),
@@ -1781,6 +1855,13 @@ def main() -> None:
                     args.alpha, args.clip_percentile, model_title, img_out_dir / "edge",
                 )
                 cv2.imwrite(str(img_out_dir / "01_edge_extractor_and_p2_edgesab.png"), fig1)
+            elif recorder_a.p2_attn_mod is not None and pre_k in records_a and post_k in records_a:
+                fig1 = build_p2_sab_figure(
+                    ref_panel, records_a[pre_k], proj_a[pre_k], records_a[post_k], proj_a[post_k],
+                    recorder_a.p2_attn_mod, args.imgsz, crop_box, colormap_id,
+                    args.alpha, args.clip_percentile, model_title,
+                )
+                cv2.imwrite(str(img_out_dir / "01_p2_sab_refinement_160x160.png"), fig1)
 
             # 3. Full Layer Progression (L01..L11 + L16 Skip-P3 SAB)
             fig2 = build_all_layers_progression_figure(
@@ -1804,7 +1885,8 @@ def main() -> None:
 
             # 5. Quantitative Activation & Learned Edge/SAB Parameter Chart
             fig4 = build_stats_chart(
-                records_a, proj_a, edge_info_a, edgesab_info_a, recorder_a.skip_p3_sab_mod, model_title
+                records_a, proj_a, edge_info_a, edgesab_info_a, recorder_a.skip_p3_sab_mod, model_title,
+                p2_attn_mod=recorder_a.p2_attn_mod,
             )
             cv2.imwrite(str(img_out_dir / "04_backbone_activation_stats.png"), fig4)
 
