@@ -52,7 +52,9 @@ from .common import (
     Focus,
     GhostBottleneck,
     GhostConv,
+    IllumSAB,
     LightConv,
+    MultiPriorIllumExtractor,
     Proto,
     PSABlock,
     SCDown,
@@ -100,7 +102,7 @@ def get_yolov11_cfg_dict(
             [-1, 1, "Conv", [64, 3, 2]],               # 0-P1/2
             [-1, 1, "Conv", [128, 3, 2]],              # 1-P2/4
             [-1, 2, "C3k2", [256, False, 0.25]],       # 2-P2/4
-            [-1, 1, "SAB", [4, False, 2]],             # 3-P2/4 (160x160 Pure Transposed SAB, gamma=0.1, no Edge)
+            [-1, 1, "IllumSAB", [4, False, 2]],        # 3-P2/4 (160x160 CWA Multi-Prior IllumSAB, gamma=0.1)
             [-1, 1, "Conv", [256, 3, 2]],              # 4-P3/8
             [-1, 2, "C3k2", [512, False, 0.25]],       # 5-P3/8
             [-1, 1, "Conv", [512, 3, 2]],              # 6-P4/16
@@ -642,6 +644,7 @@ def parse_model(
         "CBAM": CBAM,
         "SAB": SAB,
         "EdgeSAB": EdgeSAB,
+        "IllumSAB": IllumSAB,
         "Concat": Concat,
         "Proto": Proto,
         "Detect": Detect,
@@ -681,7 +684,7 @@ def parse_model(
             args = [ch_list[f]]
         elif m is Concat:
             c2 = sum(ch_list[x] for x in f)
-        elif m in {SAB, EdgeSAB}:
+        elif m in {SAB, EdgeSAB, IllumSAB}:
             c1 = ch_list[f] if isinstance(f, int) else ch_list[f[0]]
             c2 = c1
             args = [c1, *args]
@@ -730,6 +733,11 @@ class BaseModel(nn.Module):
             if hasattr(self, "edge_extractor") and self.edge_extractor is not None
             else None
         )
+        illum_map = (
+            self.illum_extractor(x)
+            if hasattr(self, "illum_extractor") and self.illum_extractor is not None
+            else None
+        )
         y = []
         for m in self.model:
             if m.f != -1:
@@ -740,6 +748,8 @@ class BaseModel(nn.Module):
                 )
             if isinstance(m, EdgeSAB):
                 x = m(x, edge_map=edge_map)
+            elif isinstance(m, IllumSAB):
+                x = m(x, illum_map=illum_map)
             else:
                 x = m(x)
             y.append(x if m.i in self.save else None)
@@ -838,6 +848,11 @@ class DetectionModel(BaseModel):
         self.edge_extractor = (
             EdgeExtractor(in_channels=ch, rgb_to_gray=(ch == 3))
             if any(isinstance(m, EdgeSAB) for m in self.model)
+            else None
+        )
+        self.illum_extractor = (
+            MultiPriorIllumExtractor(in_channels=ch, downsample_stride=4)
+            if any(isinstance(m, IllumSAB) for m in self.model)
             else None
         )
         self.names = [str(i) for i in range(self.yaml["nc"])]
@@ -1034,8 +1049,11 @@ class YOLOv11Backbone(nn.Module):
             Conv(c(64), c(128), k=3, s=2),
             C3k2(c(128), c(256), n=d(2), c3k=c3k_override, e=0.25),
         )
-        # Layer 3: P2/4 (160x160) Pure Transposed Self-Attention (no Edge)
-        self.attn_p2 = SAB(
+        # Layer 3: P2/4 (160x160) Multi-Prior CWA Illumination-Guided SAB (PA1)
+        self.illum_extractor = MultiPriorIllumExtractor(
+            in_channels=in_channels, downsample_stride=4
+        )
+        self.attn_p2 = IllumSAB(
             c(256), num_heads=4, bias=False, reduction=2, gamma_init=0.1
         )
 
@@ -1062,9 +1080,10 @@ class YOLOv11Backbone(nn.Module):
     def forward(
         self, x: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        illum_map = self.illum_extractor(x)       # Multi-Prior S_L at P2/4
         x = self.stem(x)                          # P1/2
         x = self.stage1(x)                        # P2/4
-        x = self.attn_p2(x)                       # P2/4 Pure SAB
+        x = self.attn_p2(x, illum_map=illum_map)  # P2/4 IllumSAB (PA1)
         p3 = self.stage2(x)                       # P3/8
         p4 = self.stage3(p3)                      # P4/16
         p5 = self.stage4(p4)                      # P5/32

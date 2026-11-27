@@ -178,6 +178,10 @@ def _register_ultralytics_unpickle_aliases() -> None:
         "DFL",
         "EdgeSAB",
         "EdgeExtractor",
+        "MultiPriorIllumExtractor",
+        "ComponentWiseAttention",
+        "IllumRetinexGate",
+        "IllumSAB",
         "GhostBottleneck",
         "PSA",
         "PSABlock",
@@ -397,7 +401,10 @@ def load_yolov11_checkpoint(
 
     def _has_edgesab_at(keys: List[str], idx: int) -> bool:
         p = f"model.{idx}."
-        return any(k.startswith((f"{p}q.", f"{p}gamma", f"{p}edge_gate.")) for k in keys)
+        return any(
+            k.startswith((f"{p}q.", f"{p}gamma", f"{p}edge_gate.", f"{p}illum_gate."))
+            for k in keys
+        )
 
     def _has_detect_at(keys: List[str], idx: int) -> bool:
         p = f"model.{idx}."

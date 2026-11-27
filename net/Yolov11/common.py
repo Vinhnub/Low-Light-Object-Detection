@@ -1071,6 +1071,261 @@ class EdgeSAB(nn.Module):
         return x + self.gamma * out
 
 
+class MultiPriorIllumExtractor(nn.Module):
+    """
+    Parameter-free Multi-Prior Analytic Luminance Stack inspired by Multinex (CVPR 2026).
+
+    Computes the 4 complementary illumination descriptors S_L(I) in FP32 for AMP safety:
+      1. Y_Rec.709   = 0.2126*R + 0.7152*G + 0.0722*B        (ITU-R BT.709 perceptual brightness)
+      2. Y_vmax      = max(R, G, B)                           (Max-RGB / highlight energy proxy)
+      3. Y_lightness = 0.5 * (max(R, G, B) + min(R, G, B))   (HSL lightness / contrast regularization)
+      4. Y_L2        = sqrt((R^2 + G^2 + B^2) / 3 + eps)     (Normalized RGB vector energy in [0, 1])
+
+    Applies stride-4 area/average downsampling before analytic extraction to suppress high-ISO
+    dark-region shot noise (~16x variance reduction) while cutting extraction FLOPs by 16x for P2/4.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        downsample_stride: int = 4,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.downsample_stride = int(downsample_stride)
+        self.eps = float(eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        device_type = "cuda" if x.is_cuda else "cpu"
+        with torch.amp.autocast(device_type=device_type, enabled=False):
+            x_fp32 = x.float().clamp(0.0, 1.0)
+            s = self.downsample_stride
+            if s > 1 and h >= s and w >= s:
+                if (h % s == 0) and (w % s == 0):
+                    x_ds = F.avg_pool2d(x_fp32, kernel_size=s, stride=s)
+                else:
+                    x_ds = F.interpolate(
+                        x_fp32,
+                        size=(max(1, h // s), max(1, w // s)),
+                        mode="area",
+                    )
+            else:
+                x_ds = x_fp32
+
+            if c == 3:
+                r = x_ds[:, 0:1]
+                g = x_ds[:, 1:2]
+                b_ch = x_ds[:, 2:3]
+                y_rec709 = 0.2126 * r + 0.7152 * g + 0.0722 * b_ch
+                y_vmax = x_ds.amax(dim=1, keepdim=True)
+                y_vmin = x_ds.amin(dim=1, keepdim=True)
+                y_lightness = 0.5 * (y_vmax + y_vmin)
+                y_l2 = torch.sqrt((r * r + g * g + b_ch * b_ch) * (1.0 / 3.0) + self.eps)
+            else:
+                y_rec709 = x_ds.mean(dim=1, keepdim=True)
+                y_vmax = x_ds.amax(dim=1, keepdim=True)
+                y_vmin = x_ds.amin(dim=1, keepdim=True)
+                y_lightness = 0.5 * (y_vmax + y_vmin)
+                y_l2 = torch.sqrt((x_ds * x_ds).mean(dim=1, keepdim=True) + self.eps)
+
+            illum_stack = torch.cat([y_rec709, y_vmax, y_lightness, y_l2], dim=1)
+        return illum_stack.to(dtype=x.dtype)
+
+
+class ComponentWiseAttention(nn.Module):
+    """
+    Multinex Component-wise Attention (CWA, Eq. 16):
+      A = sigmoid(Conv1x1_nobias(DWConv7x7(S)))
+
+    Preserves per-descriptor independence via grouped 7x7 spatial filtering before
+    bias-free 1x1 channel alignment into soft attention maps in (0, 1).
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 7):
+        super().__init__()
+        padding = kernel_size // 2
+        self.dwconv = nn.Conv2d(
+            in_channels,
+            in_channels,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=padding,
+            groups=in_channels,
+            bias=True,
+        )
+        self.pwconv = nn.Conv2d(
+            in_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False
+        )
+        self.act = nn.Sigmoid()
+
+    def forward(self, s: torch.Tensor) -> torch.Tensor:
+        return self.act(self.pwconv(self.dwconv(s)))
+
+
+class IllumRetinexGate(nn.Module):
+    """
+    Post-Attention Feature-Space Retinex-Delta FiLM Gate conditioned on S_L via Multinex CWA.
+    Produces spatially-adaptive per-channel (scale, shift) where scale initializes near 1.0
+    and shift initializes near 0.0 to preserve pretrained COCO backbone features at epoch 0.
+    """
+
+    def __init__(self, illum_channels: int, dim: int, kernel_size: int = 7):
+        super().__init__()
+        hidden = max(dim // 4, 16)
+        self.proj = nn.Conv2d(illum_channels, hidden, kernel_size=1, bias=True)
+        self.proj_act = nn.SiLU()
+        self.cwa = ComponentWiseAttention(illum_channels, hidden, kernel_size=kernel_size)
+        self.refine_dw = nn.Conv2d(
+            hidden, hidden, kernel_size=3, stride=1, padding=1, groups=hidden, bias=True
+        )
+        self.refine_pw = nn.Conv2d(hidden, hidden, kernel_size=1, bias=True)
+        self.refine_act = nn.SiLU()
+        self.scale_head = nn.Conv2d(hidden, dim, kernel_size=1, bias=True)
+        self.shift_head = nn.Conv2d(hidden, dim, kernel_size=1, bias=True)
+
+        # Near-identity init with strong step-1 gradient flow (2 * sigmoid(0) = 1.0, shift ≈ 0.0)
+        nn.init.normal_(self.scale_head.weight, mean=0.0, std=0.05)
+        nn.init.zeros_(self.scale_head.bias)
+        nn.init.normal_(self.shift_head.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.shift_head.bias)
+
+    def forward(self, illum: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        feat = self.proj_act(self.proj(illum))
+        feat = feat * self.cwa(illum)
+        feat = self.refine_act(self.refine_pw(self.refine_dw(feat)))
+        scale = 2.0 * torch.sigmoid(self.scale_head(feat))
+        shift = self.shift_head(feat)
+        return scale, shift
+
+
+class IllumSAB(nn.Module):
+    """
+    PA1: Multi-Prior CWA Illumination-Guided Transposed Channel Self-Attention Block (IllumSAB).
+
+    Enhances Backbone P2 (160x160) SAB with Multinex's 4-channel analytic luminance stack S_L:
+      1. Pre-Attention Centered CWA Q/K Re-weighting:
+         Modulates Q and K by `1 + 0.9 * tanh(illum_scale) * (2 * CWA(S_L) - 1)` in (0.1, 1.9),
+         allowing the network to simultaneously boost dark-region correlations and suppress
+         glaring light sources before spatial L2 normalization in transposed channel attention.
+      2. Post-Attention Retinex-Delta FiLM Gate (`IllumRetinexGate`):
+         Applies spatially-adaptive per-channel `(scale * out + shift)` before residual fusion
+         `x + gamma * out` (with `gamma_init=0.1` for smooth pretrained weight adaptation).
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 4,
+        bias: bool = False,
+        reduction: int = 2,
+        kv_dim: Optional[int] = None,
+        gamma_init: float = 0.1,
+        illum_channels: int = 4,
+        illum_scale_init: float = 0.5,
+    ):
+        super().__init__()
+        inner_dim = max(dim // max(reduction, 1), num_heads)
+        inner_dim = max(num_heads, (inner_dim // num_heads) * num_heads)
+        assert inner_dim % num_heads == 0, (
+            f"inner_dim ({inner_dim}) must be divisible by num_heads ({num_heads})"
+        )
+
+        kv_in = kv_dim or dim
+        self.dim = dim
+        self.inner_dim = inner_dim
+        self.num_heads = num_heads
+        self.head_dim = inner_dim // num_heads
+        self.illum_channels = illum_channels
+
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+        self.gamma = nn.Parameter(torch.full((1, dim, 1, 1), float(gamma_init)))
+        self.illum_scale = nn.Parameter(torch.full((1, inner_dim, 1, 1), float(illum_scale_init)))
+
+        self.q = nn.Conv2d(dim, inner_dim, kernel_size=1, bias=bias)
+        self.q_dwconv = nn.Conv2d(
+            inner_dim, inner_dim, kernel_size=3, stride=1, padding=1, groups=inner_dim, bias=bias
+        )
+        self.kv = nn.Conv2d(kv_in, inner_dim * 2, kernel_size=1, bias=bias)
+        self.kv_dwconv = nn.Conv2d(
+            inner_dim * 2,
+            inner_dim * 2,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=inner_dim * 2,
+            bias=bias,
+        )
+
+        self.illum_qk_cwa = ComponentWiseAttention(illum_channels, inner_dim, kernel_size=7)
+        self.illum_gate = IllumRetinexGate(illum_channels, dim, kernel_size=7)
+
+        self.ffn_gate = nn.Sequential(
+            nn.Conv2d(
+                inner_dim, inner_dim, kernel_size=3, stride=1, padding=1, groups=inner_dim, bias=False
+            ),
+            nn.SiLU(inplace=True),
+        )
+        self.project_out = nn.Conv2d(inner_dim, dim, kernel_size=1, bias=bias)
+
+    def forward(
+        self,
+        x: Union[torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor, ...]],
+        y: Optional[torch.Tensor] = None,
+        illum_map: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if isinstance(x, (list, tuple)):
+            if y is None and len(x) >= 2:
+                x, y = x[0], x[1]
+            else:
+                x = x[0]
+        if y is None:
+            y = x
+
+        b, _, h, w = x.shape
+        q = self.q_dwconv(self.q(x))
+        kv = self.kv_dwconv(self.kv(y))
+        k, v = kv.chunk(2, dim=1)
+
+        illum_scaled: Optional[torch.Tensor] = None
+        if illum_map is not None:
+            if illum_map.shape[-2:] != (h, w):
+                illum_scaled = F.interpolate(
+                    illum_map, size=(h, w), mode="bilinear", align_corners=False
+                )
+            else:
+                illum_scaled = illum_map
+            illum_scaled = illum_scaled.to(dtype=x.dtype)
+
+            qk_attn = self.illum_qk_cwa(illum_scaled)
+            qk_scale = 0.9 * torch.tanh(self.illum_scale).to(dtype=q.dtype)
+            qk_weight = 1.0 + qk_scale * (2.0 * qk_attn - 1.0)
+            q = q * qk_weight
+            k = k * qk_weight
+
+        q = q.reshape(b, self.num_heads, self.head_dim, h * w)
+        k = k.reshape(b, self.num_heads, self.head_dim, h * w)
+        v = v.reshape(b, self.num_heads, self.head_dim, h * w)
+
+        # Normalize in FP32 to prevent FP16 overflow when summing squares over H*W
+        q_norm = F.normalize(q.float(), dim=-1, eps=1e-6)
+        k_norm = F.normalize(k.float(), dim=-1, eps=1e-6)
+
+        attn = (q_norm @ k_norm.transpose(-2, -1)) * self.temperature.float()
+        attn = F.softmax(attn, dim=-1)
+
+        out = (attn @ v.float()).to(x.dtype).reshape(b, self.inner_dim, h, w)
+        out = out * self.ffn_gate(out)
+        out = self.project_out(out)
+
+        if illum_scaled is not None:
+            scale, shift = self.illum_gate(illum_scaled)
+            out = out * scale + shift
+
+        return x + self.gamma * out
+
+
 class C3k2(C2f):
     """
     C2f variant whose inner blocks are Bottleneck, C3k, or Bottleneck + PSABlock attention modules.
