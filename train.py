@@ -497,7 +497,8 @@ def make_scheduler(lr=None):
 def set_backbone_trainable(net: torch.nn.Module, trainable: bool) -> None:
     """
     Freeze or unfreeze pretrained backbone parameters for staged fine-tuning.
-    Always keeps newly added edge/attention blocks (`EdgeSAB`, `SAB`, `EdgeExtractor`)
+    Always keeps newly added edge/illumination/attention blocks
+    (`EdgeSAB`, `CrossIllumSAB`, `SAB`, `EdgeExtractor`, `MultiPriorIllumExtractor`)
     trainable so they can learn even while pretrained COCO backbone layers are frozen.
     """
     raw_net = de_parallel(net)
@@ -517,11 +518,20 @@ def set_backbone_trainable(net: torch.nn.Module, trainable: bool) -> None:
 
     if not trainable:
         for mod in target.modules():
-            if type(mod).__name__ in {"EdgeSAB", "SAB", "EdgeExtractor"}:
+            if type(mod).__name__ in {
+                "EdgeSAB",
+                "CrossIllumSAB",
+                "SAB",
+                "EdgeExtractor",
+                "MultiPriorIllumExtractor",
+            }:
                 for p in mod.parameters():
                     p.requires_grad = True
         if hasattr(raw_net, "edge_extractor") and raw_net.edge_extractor is not None:
             for p in raw_net.edge_extractor.parameters():
+                p.requires_grad = True
+        if hasattr(raw_net, "illum_extractor") and raw_net.illum_extractor is not None:
+            for p in raw_net.illum_extractor.parameters():
                 p.requires_grad = True
 
 
