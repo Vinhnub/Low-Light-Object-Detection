@@ -2,17 +2,18 @@
 tools/visualize_backbone_yolov11.py
 
 Visualize multi-scale YOLOv11 Backbone feature maps across spatial resolutions
-from 160x160 down to 20x20 (for 640x640 input):
-  - Stage 1 (P2/4,  160x160): L01_Conv3x3_P2_4  -> L02_C3k2_P2_4
-  - Stage 2 (P3/8,   80x80 ): L03_Conv3x3_P3_8  -> L04_C3k2_P3_8  (Skip-P3)
-  - Stage 3 (P4/16,  40x40 ): L05_Conv3x3_P4_16 -> L06_C3k2_P4_16 (Skip-P4)
-  - Stage 4 (P5/32,  20x20 ): L07_Conv3x3_P5_32 -> L08_C3k2_P5_32 -> L09_SPPF_P5_32 -> L10_C2PSA_P5_32 (Skip-P5)
+from 160x160 down to 20x20 (for 640x640 input), supporting both:
+  - 25-layer P2-IllumSAB / P2-SAB / P2-EdgeSAB Backbone (`develop-yolov11-p2-illumsab`, L01..L11):
+      - Stage 1 (P2/4,  160x160): L01_Conv3x3_P2_4  -> L02_C3k2_P2_4 -> L03_IllumSAB_P2_4
+      - Stage 2 (P3/8,   80x80 ): L04_Conv3x3_P3_8  -> L05_C3k2_P3_8 (Skip-P3)
+      - Stage 3 (P4/16,  40x40 ): L06_Conv3x3_P4_16 -> L07_C3k2_P4_16 (Skip-P4)
+      - Stage 4 (P5/32,  20x20 ): L08_Conv3x3_P5_32 -> L09_C3k2_P5_32 -> L10_SPPF_P5_32 -> L11_C2PSA_P5_32 (Skip-P5)
+  - 24-layer Standard / Skip-P3 Backbone (`main`, L01..L10)
   - Optional Stem (P1/2, 320x320): L00_Stem_Conv3x3_P1_2 via `--include_stem`
 
-Compatible with both `main` and `develop-yolov11*` branches, supporting:
-  - Sequential `DetectionModel` (`model.0..10`) and modular `YOLOv11` (`backbone.*`)
-  - Official COCO pretrained weights (`.pt` or `--weights auto`) and custom trained `.pth` checkpoints
-  - Optional side-by-side Backbone comparison mode via `--compare_weights`
+For deep P2-IllumSAB internal diagnostics (Multinex 4-channel S_L priors, CWA A_qk/W_qk,
+Retinex FiLM scale/shift, 4-head channel attention, Dark/Mid/Bright regime table),
+use `tools/visualize_backbone_illumsab_yolov11.py`.
 
 Outputs saved under `<output>/<run_name>/<image_stem>/`:
   - `00_backbone_pyramid_160_to_20.png`     - Key stage outputs (160 -> 80 -> 40 -> 20): Overlay, Native Grid, PCA-RGB
@@ -71,33 +72,58 @@ from net import (  # noqa: E402
     load_yolo_checkpoint,
     non_max_suppression,
 )
+from net.Yolov11.common import EdgeSAB, IllumSAB, SAB  # noqa: E402
 from net.Yolov11.utils import (  # noqa: E402
     _register_ultralytics_unpickle_aliases,
     de_parallel,
     scale_boxes,
 )
+from net.Yolov11.yolo import DetectionModel  # noqa: E402
+from tools.visualize_backbone_illumsab_yolov11 import (  # noqa: E402
+    _build_arch_cfg_dict,
+    _extract_raw_sd,
+    _infer_nc_from_sd,
+    _infer_variant_from_sd,
+    detect_ckpt_arch,
+    detect_is_modular_ckpt as _detect_is_modular_sd,
+)
 
 
 # ==================================================================================================
-# 1. YOLOv11 Backbone Metadata (L00..L10: 320 -> 160 -> 80 -> 40 -> 20)
+# 1. YOLOv11 Backbone Metadata (Base L00..L10 & P2-IllumSAB/SAB/EdgeSAB L00..L11)
 # ==================================================================================================
 
-# (stage_group, canonical_label, stride, is_stage_output)
-YOLOV11_BACKBONE_META: Dict[int, Tuple[str, str, int, bool]] = {
-    0: ("P1/2 (Stem)", "L00_Stem_Conv3x3_P1_2", 2, True),
-    1: ("P2/4 (Stage1)", "L01_Conv3x3_P2_4", 4, False),
-    2: ("P2/4 (Stage1)", "L02_C3k2_P2_4", 4, True),
-    3: ("P3/8 (Stage2)", "L03_Conv3x3_P3_8", 8, False),
-    4: ("P3/8 (Stage2)", "L04_C3k2_P3_8_SkipP3", 8, True),
-    5: ("P4/16 (Stage3)", "L05_Conv3x3_P4_16", 16, False),
-    6: ("P4/16 (Stage3)", "L06_C3k2_P4_16_SkipP4", 16, True),
-    7: ("P5/32 (Stage4)", "L07_Conv3x3_P5_32", 32, False),
-    8: ("P5/32 (Stage4)", "L08_C3k2_P5_32", 32, False),
-    9: ("P5/32 (Stage4)", "L09_SPPF_P5_32", 32, False),
-    10: ("P5/32 (Stage4)", "L10_C2PSA_P5_32_SkipP5", 32, True),
+# (stage_group, canonical_label, stride, is_stage_output, semantic_slot)
+YOLOV11_BACKBONE_BASE_META: Dict[int, Tuple[str, str, int, bool, str]] = {
+    0: ("P1/2 (Stem)", "L00_Stem_Conv3x3_P1_2", 2, True, "p1"),
+    1: ("P2/4 (Stage1)", "L01_Conv3x3_P2_4", 4, False, ""),
+    2: ("P2/4 (Stage1)", "L02_C3k2_P2_4", 4, True, "p2"),
+    3: ("P3/8 (Stage2)", "L03_Conv3x3_P3_8", 8, False, ""),
+    4: ("P3/8 (Stage2)", "L04_C3k2_P3_8_SkipP3", 8, True, "p3"),
+    5: ("P4/16 (Stage3)", "L05_Conv3x3_P4_16", 16, False, ""),
+    6: ("P4/16 (Stage3)", "L06_C3k2_P4_16_SkipP4", 16, True, "p4"),
+    7: ("P5/32 (Stage4)", "L07_Conv3x3_P5_32", 32, False, ""),
+    8: ("P5/32 (Stage4)", "L08_C3k2_P5_32", 32, False, "s4_c3k2"),
+    9: ("P5/32 (Stage4)", "L09_SPPF_P5_32", 32, False, "s4_sppf"),
+    10: ("P5/32 (Stage4)", "L10_C2PSA_P5_32_SkipP5", 32, True, "p5"),
 }
 
-KEY_PYRAMID_INDICES: Tuple[int, int, int, int] = (2, 4, 6, 10)  # 160 -> 80 -> 40 -> 20
+YOLOV11_BACKBONE_P2_ATTN_META: Dict[int, Tuple[str, str, int, bool, str]] = {
+    0: ("P1/2 (Stem)", "L00_Stem_Conv3x3_P1_2", 2, True, "p1"),
+    1: ("P2/4 (Stage1)", "L01_Conv3x3_P2_4", 4, False, ""),
+    2: ("P2/4 (Stage1)", "L02_C3k2_P2_4_PreAttn", 4, True, "p2_pre"),
+    3: ("P2/4 (P2-Attn)", "L03_P2Attn_P2_4_160", 4, True, "p2"),
+    4: ("P3/8 (Stage2)", "L04_Conv3x3_P3_8", 8, False, ""),
+    5: ("P3/8 (Stage2)", "L05_C3k2_P3_8_SkipP3", 8, True, "p3"),
+    6: ("P4/16 (Stage3)", "L06_Conv3x3_P4_16", 16, False, ""),
+    7: ("P4/16 (Stage3)", "L07_C3k2_P4_16_SkipP4", 16, True, "p4"),
+    8: ("P5/32 (Stage4)", "L08_Conv3x3_P5_32", 32, False, ""),
+    9: ("P5/32 (Stage4)", "L09_C3k2_P5_32", 32, False, "s4_c3k2"),
+    10: ("P5/32 (Stage4)", "L10_SPPF_P5_32", 32, False, "s4_sppf"),
+    11: ("P5/32 (Stage4)", "L11_C2PSA_P5_32_SkipP5", 32, True, "p5"),
+}
+
+KEY_PYRAMID_SLOTS: Tuple[str, ...] = ("p2", "p3", "p4", "p5")
 
 STAGE_ACCENT_BGR: Dict[int, Tuple[int, int, int]] = {
     2: (200, 200, 90),    # P1/2  (320) - Cyan-Teal
@@ -338,17 +364,22 @@ def load_yolov11_for_backbone(
     is_auto_or_none = w_str.lower() in {"auto", "none", "false", "no"}
 
     ckpt_meta: Any = None
+    raw_sd: Dict[str, Any] = {}
     if not is_auto_or_none:
         if not os.path.exists(w_str):
             raise FileNotFoundError(f"Weights file not found: {w_str}")
         _register_ultralytics_unpickle_aliases()
         ckpt_meta = torch.load(w_str, map_location="cpu", weights_only=False)
+        raw_sd = _extract_raw_sd(ckpt_meta)
 
     if model_override.strip():
         model_name = model_override.strip().lower()
     elif ckpt_meta is not None:
         inferred = infer_model_from_checkpoint(ckpt_meta, fallback_path=w_str)
-        model_name = inferred if (inferred and get_model_family(inferred) == "yolov11") else "yolov11s"
+        if inferred and get_model_family(inferred) == "yolov11":
+            model_name = inferred
+        else:
+            model_name = _infer_variant_from_sd(raw_sd) or "yolov11s"
     else:
         model_name = "yolov11s"
 
@@ -365,22 +396,31 @@ def load_yolov11_for_backbone(
             nc = int(ckpt_meta["model"].nc)
         elif isinstance(getattr(ckpt_meta.get("model"), "yaml", None), dict):
             nc = ckpt_meta["model"].yaml.get("nc")
+    if nc is None and raw_sd:
+        nc = _infer_nc_from_sd(raw_sd)
     if nc is None:
         nc = 80 if w_str.lower() == "auto" else 12
     nc = int(nc)
 
     is_modular = (
-        detect_is_modular_ckpt(ckpt_meta) if modular_override is None else bool(modular_override)
+        _detect_is_modular_sd(raw_sd) if modular_override is None else bool(modular_override)
     )
     cfg_path = cfg_override if (cfg_override and os.path.exists(cfg_override)) else None
+    detected_arch = detect_ckpt_arch(raw_sd) if raw_sd else None
 
-    model = build_yolo_model(
-        model_name=model_name,
-        num_classes=nc,
-        in_channels=3,
-        cfg=cfg_path,
-        modular=is_modular,
-    )
+    if cfg_path is not None or is_modular or detected_arch in {None, "modular", "p2_illumsab"}:
+        model = build_yolo_model(
+            model_name=model_name,
+            num_classes=nc,
+            in_channels=3,
+            cfg=cfg_path,
+            modular=is_modular,
+        )
+    else:
+        cfg_dict = _build_arch_cfg_dict(model_name, nc, detected_arch)
+        model = DetectionModel(cfg=cfg_dict, ch=3, nc=nc)
+        if detected_arch == "p2_illumsab_v1" and getattr(model, "illum_extractor", None) is not None:
+            model.illum_extractor.log_mu = 0.0
     if w_str.lower() not in {"none", "false", "no"}:
         load_yolo_checkpoint(model, w_str, model_name=model_name, verbose=True)
 
@@ -416,7 +456,7 @@ def load_yolov11_for_backbone(
 
 class YOLOv11BackboneRecorder:
     """
-    Captures YOLOv11 Backbone layers L01..L10 (160x160 -> 80x80 -> 40x40 -> 20x20),
+    Captures YOLOv11 Backbone layers (L01..L11 for P2-IllumSAB/SAB/EdgeSAB, or L01..L10 for Base),
     plus optional L00 Stem (320x320), supporting both `DetectionModel` and modular `YOLOv11`.
     """
 
@@ -425,11 +465,16 @@ class YOLOv11BackboneRecorder:
         self.include_stem = include_stem
         self.handles: List[Any] = []
         self.records: "OrderedDict[int, Dict[str, Any]]" = OrderedDict()
+        self.stage_slots: Dict[str, int] = {}
+        self.has_p2_attn: bool = False
         self._register()
 
-    def _make_hook(self, layer_idx: int, mod: nn.Module):
-        stage_group, label, stride, is_stage_out = YOLOV11_BACKBONE_META[layer_idx]
+    def _make_hook(self, layer_idx: int, mod: nn.Module, meta_row: Tuple[str, str, int, bool, str]):
+        stage_group, label, stride, is_stage_out, slot = meta_row
         mod_type = type(mod).__name__
+        if layer_idx == 3 and self.has_p2_attn:
+            stage_group = f"P2/4 ({mod_type})"
+            label = f"L03_{mod_type}_P2_4_160"
 
         def hook_fn(_module, _inputs, output):
             if isinstance(output, torch.Tensor):
@@ -439,6 +484,7 @@ class YOLOv11BackboneRecorder:
                     "label": label,
                     "stride": stride,
                     "is_stage_out": is_stage_out,
+                    "slot": slot,
                     "mod_type": mod_type,
                     "tensor": output.detach().float().cpu(),
                 }
@@ -447,32 +493,46 @@ class YOLOv11BackboneRecorder:
 
     def _register(self) -> None:
         start_idx = 0 if self.include_stem else 1
-        target_indices = list(range(start_idx, 11))
+        p2_types = (IllumSAB, SAB, EdgeSAB)
 
         if hasattr(self.model, "model") and isinstance(self.model.model, nn.Sequential):
-            for idx in target_indices:
-                if idx < len(self.model.model):
-                    mod = self.model.model[idx]
-                    self.handles.append(mod.register_forward_hook(self._make_hook(idx, mod)))
+            layers = list(self.model.model)
+            self.has_p2_attn = len(layers) > 3 and isinstance(layers[3], p2_types)
+            meta_tbl = YOLOV11_BACKBONE_P2_ATTN_META if self.has_p2_attn else YOLOV11_BACKBONE_BASE_META
+            for idx in range(start_idx, len(meta_tbl)):
+                if idx < len(layers):
+                    mod = layers[idx]
+                    row = meta_tbl[idx]
+                    self.handles.append(mod.register_forward_hook(self._make_hook(idx, mod, row)))
+                    if row[4]:
+                        self.stage_slots[row[4]] = idx
         elif hasattr(self.model, "backbone"):
             bb = self.model.backbone
+            self.has_p2_attn = hasattr(bb, "attn_p2") and isinstance(bb.attn_p2, p2_types)
+            meta_tbl = YOLOV11_BACKBONE_P2_ATTN_META if self.has_p2_attn else YOLOV11_BACKBONE_BASE_META
+            off = 1 if self.has_p2_attn else 0
             mod_map: Dict[int, nn.Module] = {
                 0: bb.stem,
                 1: bb.stage1[0],
                 2: bb.stage1[1],
-                3: bb.stage2[0],
-                4: bb.stage2[1],
-                5: bb.stage3[0],
-                6: bb.stage3[1],
-                7: bb.stage4[0],
-                8: bb.stage4[1],
-                9: bb.stage4[2],
-                10: bb.stage4[3],
+                3 + off: bb.stage2[0],
+                4 + off: bb.stage2[1],
+                5 + off: bb.stage3[0],
+                6 + off: bb.stage3[1],
+                7 + off: bb.stage4[0],
+                8 + off: bb.stage4[1],
+                9 + off: bb.stage4[2],
+                10 + off: bb.stage4[3],
             }
-            for idx in target_indices:
+            if self.has_p2_attn:
+                mod_map[3] = bb.attn_p2
+            for idx in range(start_idx, len(meta_tbl)):
                 if idx in mod_map:
                     mod = mod_map[idx]
-                    self.handles.append(mod.register_forward_hook(self._make_hook(idx, mod)))
+                    row = meta_tbl[idx]
+                    self.handles.append(mod.register_forward_hook(self._make_hook(idx, mod, row)))
+                    if row[4]:
+                        self.stage_slots[row[4]] = idx
         else:
             raise AttributeError("Unsupported YOLOv11 model structure: missing `.model` and `.backbone`.")
 
@@ -866,6 +926,7 @@ def build_pyramid_hero_figure(
     gt_panel: np.ndarray,
     records: "OrderedDict[int, Dict[str, Any]]",
     projections: Dict[int, Dict[str, Any]],
+    stage_slots: Dict[str, int],
     lb_size: int,
     crop_box: Tuple[int, int, int, int],
     colormap_id: int,
@@ -876,12 +937,12 @@ def build_pyramid_hero_figure(
 ) -> np.ndarray:
     """
     Create `00_backbone_pyramid_160_to_20.png`:
-      - Row 1: Raw Input + 4 Stage Outputs (160 -> 80 -> 40 -> 20) Smooth L2 Overlay
-      - Row 2: Brightened Ref + 4 Stage Outputs Native-Grid L2 Heatmap (true cell resolution)
-      - Row 3: Detections (or GT) + 4 Stage Outputs PCA 3-Component RGB Semantic Map
+      - Row 1: Raw Input + Stage Outputs (160 -> 80 -> 40 -> 20) Smooth L2 Overlay
+      - Row 2: Brightened Ref + Stage Outputs Native-Grid L2 Heatmap
+      - Row 3: Detections (or GT) + Stage Outputs PCA 3-Component RGB Semantic Map
     """
     ph, pw = ref_panel.shape[:2]
-    key_indices = [idx for idx in KEY_PYRAMID_INDICES if idx in records]
+    key_indices = [stage_slots[s] for s in ("p2_pre", "p2", "p3", "p4", "p5") if s in stage_slots and stage_slots[s] in records]
 
     row1: List[np.ndarray] = [
         make_labeled_tile(raw_panel, "Input (Raw Low-Light)", f"{img_name}", (130, 140, 155))
@@ -985,6 +1046,7 @@ def build_stage4_20x20_refinement_figure(
     ref_panel: np.ndarray,
     records: "OrderedDict[int, Dict[str, Any]]",
     projections: Dict[int, Dict[str, Any]],
+    stage_slots: Dict[str, int],
     lb_size: int,
     crop_box: Tuple[int, int, int, int],
     colormap_id: int,
@@ -992,8 +1054,8 @@ def build_stage4_20x20_refinement_figure(
     clip_pct: float,
     model_title: str,
 ) -> Optional[np.ndarray]:
-    """Create `02_stage4_20x20_refinement.png`: L07 Conv -> L08 C3k2 -> L09 SPPF -> L10 C2PSA + Delta."""
-    s4_indices = [idx for idx in (7, 8, 9, 10) if idx in records]
+    """Create `02_stage4_20x20_refinement.png`: Stage 4 Conv -> C3k2 -> SPPF -> C2PSA + Delta."""
+    s4_indices = [idx for idx, rec in records.items() if rec["stride"] == 32]
     if len(s4_indices) < 2:
         return None
 
@@ -1024,10 +1086,11 @@ def build_stage4_20x20_refinement_figure(
             )
         )
 
-    # C2PSA spatial attention delta: |L10_C2PSA - L09_SPPF|
-    if 9 in records and 10 in records:
-        t9 = records[9]["tensor"][0]
-        t10 = records[10]["tensor"][0]
+    sppf_idx = stage_slots.get("s4_sppf", -1)
+    c2psa_idx = stage_slots.get("p5", -1)
+    if sppf_idx in records and c2psa_idx in records:
+        t9 = records[sppf_idx]["tensor"][0]
+        t10 = records[c2psa_idx]["tensor"][0]
         if t9.shape == t10.shape:
             delta_l2 = torch.sqrt(((t10 - t9) ** 2).mean(dim=0) + 1e-12).numpy()
             ov_d, _, nat_d = render_views_for_map(
@@ -1037,7 +1100,7 @@ def build_stage4_20x20_refinement_figure(
             tiles.append(
                 make_labeled_tile(
                     ov_d,
-                    "C2PSA Attention Effect |L10 - L09|",
+                    f"C2PSA Effect |L{c2psa_idx:02d} - L{sppf_idx:02d}|",
                     f"Mean Delta L2={float(delta_l2.mean()):.4f}",
                     (60, 220, 255),
                 )
@@ -1045,7 +1108,7 @@ def build_stage4_20x20_refinement_figure(
             tiles.append(
                 make_labeled_tile(
                     nat_d,
-                    "C2PSA Native 20x20 |L10 - L09|",
+                    f"C2PSA Native 20x20 |L{c2psa_idx:02d} - L{sppf_idx:02d}|",
                     "Spatial regions re-weighted by PSA",
                     (60, 220, 255),
                 )
@@ -1229,9 +1292,11 @@ def build_backbone_comparison_figure(
     ref_panel: np.ndarray,
     records_a: "OrderedDict[int, Dict[str, Any]]",
     proj_a: Dict[int, Dict[str, Any]],
+    slots_a: Dict[str, int],
     label_a: str,
     records_b: "OrderedDict[int, Dict[str, Any]]",
     proj_b: Dict[int, Dict[str, Any]],
+    slots_b: Dict[str, int],
     label_b: str,
     lb_size: int,
     crop_box: Tuple[int, int, int, int],
@@ -1239,19 +1304,19 @@ def build_backbone_comparison_figure(
     alpha: float,
     clip_pct: float,
 ) -> np.ndarray:
-    """Compare two YOLOv11 checkpoints across key pyramid stages 160 -> 80 -> 40 -> 20 with shared scale."""
-    key_indices = [idx for idx in KEY_PYRAMID_INDICES if idx in records_a and idx in records_b]
+    """Compare two YOLOv11 checkpoints across semantic stages P2(160) -> P3(80) -> P4(40) -> P5(20)."""
+    common_slots = [s for s in KEY_PYRAMID_SLOTS if s in slots_a and s in slots_b]
     row_a: List[np.ndarray] = []
     row_b: List[np.ndarray] = []
     row_diff: List[np.ndarray] = []
 
-    for idx in key_indices:
-        pa, pb = proj_a[idx], proj_b[idx]
-        stride = records_a[idx]["stride"]
+    for slot in common_slots:
+        ia, ib = slots_a[slot], slots_b[slot]
+        pa, pb = proj_a[ia], proj_b[ib]
+        stride = records_a[ia]["stride"]
         _, h_f, w_f = pa["shape"]
         accent = STAGE_ACCENT_BGR.get(stride, (80, 160, 255))
 
-        # Shared range at each scale for fair visual comparison
         vmax = max(
             float(np.percentile(pa["l2"], clip_pct)),
             float(np.percentile(pb["l2"], clip_pct)),
@@ -1276,26 +1341,26 @@ def build_backbone_comparison_figure(
 
         row_a.append(
             make_labeled_tile(
-                ov_a, f"[A] L{idx:02d} ({h_f}x{w_f}) {label_a}",
+                ov_a, f"[A] {slot.upper()} L{ia:02d} ({h_f}x{w_f}) {label_a}",
                 f"L2={pa['l2_mean']:.4f} | Sparsity={pa['sparsity']:.1f}%", accent
             )
         )
         row_b.append(
             make_labeled_tile(
-                ov_b, f"[B] L{idx:02d} ({h_f}x{w_f}) {label_b}",
+                ov_b, f"[B] {slot.upper()} L{ib:02d} ({h_f}x{w_f}) {label_b}",
                 f"L2={pb['l2_mean']:.4f} | Sparsity={pb['sparsity']:.1f}%", (90, 230, 130)
             )
         )
         row_diff.append(
             make_labeled_tile(
-                diff_nat, f"|B - A| L{idx:02d} ({h_f}x{w_f})",
+                diff_nat, f"|B - A| {slot.upper()} ({h_f}x{w_f})",
                 f"Mean |Delta L2|={float(diff_2d.mean()):.4f}", (80, 210, 255)
             )
         )
 
     return assemble_grid(
         row_a + row_b + row_diff,
-        ncols=max(1, len(key_indices)),
+        ncols=max(1, len(common_slots)),
         banner_title=f"YOLOv11 Backbone Comparison (160 -> 80 -> 40 -> 20): [A] {label_a} vs [B] {label_b}",
         banner_sub="Row 1: Model A (shared scale) | Row 2: Model B (shared scale) | Row 3: Absolute L2 Difference |B - A|",
         colormap_id=colormap_id,
@@ -1428,13 +1493,13 @@ def main() -> None:
             # 1. Hero 160 -> 80 -> 40 -> 20 Pyramid Summary
             fig_hero = build_pyramid_hero_figure(
                 raw_panel, ref_panel, det_panel, gt_panel,
-                records_a, proj_a, args.imgsz, crop_box,
+                records_a, proj_a, recorder_a.stage_slots, args.imgsz, crop_box,
                 colormap_id, args.alpha, args.clip_percentile,
                 model_title, Path(img_path).name,
             )
             cv2.imwrite(str(img_out_dir / "00_backbone_pyramid_160_to_20.png"), fig_hero)
 
-            # 2. All Backbone Layers Progression (L01..L10)
+            # 2. All Backbone Layers Progression (L01..L11 or L01..L10)
             fig_all = build_all_layers_progression_figure(
                 ref_panel, records_a, proj_a, args.imgsz, crop_box,
                 colormap_id, args.alpha, args.clip_percentile, model_title,
@@ -1443,7 +1508,7 @@ def main() -> None:
 
             # 3. Stage 4 (20x20) Deep Refinement (Conv -> C3k2 -> SPPF -> C2PSA)
             fig_s4 = build_stage4_20x20_refinement_figure(
-                ref_panel, records_a, proj_a, args.imgsz, crop_box,
+                ref_panel, records_a, proj_a, recorder_a.stage_slots, args.imgsz, crop_box,
                 colormap_id, args.alpha, args.clip_percentile, model_title,
             )
             if fig_s4 is not None:
@@ -1472,16 +1537,17 @@ def main() -> None:
                 )
                 fig_cmp = build_backbone_comparison_figure(
                     ref_panel,
-                    records_a, proj_a, meta_a["weights_label"],
-                    records_b, proj_b, meta_b["weights_label"],
+                    records_a, proj_a, recorder_a.stage_slots, meta_a["weights_label"],
+                    records_b, proj_b, recorder_b.stage_slots, meta_b["weights_label"],
                     args.imgsz, crop_box, colormap_id,
                     args.alpha, args.clip_percentile,
                 )
                 cv2.imwrite(str(img_out_dir / "04_backbone_comparison_160_to_20.png"), fig_cmp)
 
             scales_str = " -> ".join(
-                f"L{i:02d}({proj_a[i]['shape'][1]}x{proj_a[i]['shape'][2]})"
-                for i in KEY_PYRAMID_INDICES if i in proj_a
+                f"L{recorder_a.stage_slots[s]:02d}({proj_a[recorder_a.stage_slots[s]]['shape'][1]}x{proj_a[recorder_a.stage_slots[s]]['shape'][2]})"
+                for s in ("p2_pre", "p2", "p3", "p4", "p5")
+                if s in recorder_a.stage_slots and recorder_a.stage_slots[s] in proj_a
             )
             print(f"  [{img_idx}/{len(image_paths)}] Saved {stem}: {scales_str} -> {img_out_dir}")
     finally:

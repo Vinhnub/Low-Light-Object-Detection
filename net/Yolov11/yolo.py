@@ -851,7 +851,7 @@ class DetectionModel(BaseModel):
             else None
         )
         self.illum_extractor = (
-            MultiPriorIllumExtractor(in_channels=ch, downsample_stride=4)
+            MultiPriorIllumExtractor(in_channels=ch, downsample_stride=4, log_mu=20.0)
             if any(isinstance(m, IllumSAB) for m in self.model)
             else None
         )
@@ -1049,9 +1049,9 @@ class YOLOv11Backbone(nn.Module):
             Conv(c(64), c(128), k=3, s=2),
             C3k2(c(128), c(256), n=d(2), c3k=c3k_override, e=0.25),
         )
-        # Layer 3: P2/4 (160x160) Multi-Prior CWA Illumination-Guided SAB (PA1)
+        # Layer 3: P2/4 (160x160) Multi-Prior CWA Illumination-Guided SAB (PA1-v2)
         self.illum_extractor = MultiPriorIllumExtractor(
-            in_channels=in_channels, downsample_stride=4
+            in_channels=in_channels, downsample_stride=4, log_mu=20.0
         )
         self.attn_p2 = IllumSAB(
             c(256), num_heads=4, bias=False, reduction=2, gamma_init=0.1

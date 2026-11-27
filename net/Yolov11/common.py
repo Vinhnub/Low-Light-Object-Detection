@@ -1073,7 +1073,8 @@ class EdgeSAB(nn.Module):
 
 class MultiPriorIllumExtractor(nn.Module):
     """
-    Parameter-free Multi-Prior Analytic Luminance Stack inspired by Multinex (CVPR 2026).
+    Parameter-free Multi-Prior Analytic Luminance Stack inspired by Multinex (CVPR 2026),
+    enhanced with Weber-Fechner / mu-law logarithmic dark-region expansion (PA1-v2).
 
     Computes the 4 complementary illumination descriptors S_L(I) in FP32 for AMP safety:
       1. Y_Rec.709   = 0.2126*R + 0.7152*G + 0.0722*B        (ITU-R BT.709 perceptual brightness)
@@ -1081,8 +1082,12 @@ class MultiPriorIllumExtractor(nn.Module):
       3. Y_lightness = 0.5 * (max(R, G, B) + min(R, G, B))   (HSL lightness / contrast regularization)
       4. Y_L2        = sqrt((R^2 + G^2 + B^2) / 3 + eps)     (Normalized RGB vector energy in [0, 1])
 
-    Applies stride-4 area/average downsampling before analytic extraction to suppress high-ISO
-    dark-region shot noise (~16x variance reduction) while cutting extraction FLOPs by 16x for P2/4.
+    Applies:
+      - Stride-4 area/average downsampling before analytic extraction to suppress high-ISO
+        dark-region shot noise (~16x variance reduction) while cutting FLOPs by 16x for P2/4.
+      - Optional mu-law log compression (`log(1 + mu * S_L) / log(1 + mu)`, default `log_mu=20.0`)
+        to expand dark-region resolution (~4x in [0, 0.15]) so CWA & FiLM gates distinguish dark
+        objects from background rather than being dominated by bright glare pixels.
     """
 
     def __init__(
@@ -1090,14 +1095,17 @@ class MultiPriorIllumExtractor(nn.Module):
         in_channels: int = 3,
         downsample_stride: int = 4,
         eps: float = 1e-6,
+        log_mu: float = 20.0,
     ):
         super().__init__()
         self.in_channels = in_channels
         self.downsample_stride = int(downsample_stride)
         self.eps = float(eps)
+        self.log_mu = float(log_mu)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, c, h, w = x.shape
+    def extract_linear(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute raw linear 4-channel S_L in FP32 [0, 1] at stride-4 resolution."""
+        _, c, h, w = x.shape
         device_type = "cuda" if x.is_cuda else "cpu"
         with torch.amp.autocast(device_type=device_type, enabled=False):
             x_fp32 = x.float().clamp(0.0, 1.0)
@@ -1130,21 +1138,37 @@ class MultiPriorIllumExtractor(nn.Module):
                 y_lightness = 0.5 * (y_vmax + y_vmin)
                 y_l2 = torch.sqrt((x_ds * x_ds).mean(dim=1, keepdim=True) + self.eps)
 
-            illum_stack = torch.cat([y_rec709, y_vmax, y_lightness, y_l2], dim=1)
+            return torch.cat([y_rec709, y_vmax, y_lightness, y_l2], dim=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        device_type = "cuda" if x.is_cuda else "cpu"
+        with torch.amp.autocast(device_type=device_type, enabled=False):
+            illum_stack = self.extract_linear(x)
+            if self.log_mu > 0.0:
+                illum_stack = torch.log1p(self.log_mu * illum_stack) / math.log1p(self.log_mu)
         return illum_stack.to(dtype=x.dtype)
 
 
 class ComponentWiseAttention(nn.Module):
     """
-    Multinex Component-wise Attention (CWA, Eq. 16):
-      A = sigmoid(Conv1x1_nobias(DWConv7x7(S)))
+    Multinex Component-wise Attention (CWA, Eq. 16) with BatchNorm dynamic-range unlocking (PA1-v2):
+      A = sigmoid(Conv1x1(BN(DWConv7x7(S))))
 
-    Preserves per-descriptor independence via grouped 7x7 spatial filtering before
-    bias-free 1x1 channel alignment into soft attention maps in (0, 1).
+    Preserves per-descriptor independence via grouped 7x7 spatial filtering, then normalizes
+    each descriptor across the dataset distribution via BatchNorm2d before 1x1 projection so
+    sigmoid activations stay well-spread across dark, mid, and bright regimes (avoiding the
+    [0.47..0.50] saturation trap on low-light scenes). Set `use_bn=False` for legacy PA1-v1.
     """
 
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 7):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 7,
+        use_bn: bool = True,
+    ):
         super().__init__()
+        self.use_bn = bool(use_bn)
         padding = kernel_size // 2
         self.dwconv = nn.Conv2d(
             in_channels,
@@ -1153,65 +1177,92 @@ class ComponentWiseAttention(nn.Module):
             stride=1,
             padding=padding,
             groups=in_channels,
-            bias=True,
+            bias=not self.use_bn,
         )
+        self.bn = nn.BatchNorm2d(in_channels) if self.use_bn else nn.Identity()
         self.pwconv = nn.Conv2d(
-            in_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False
+            in_channels,
+            out_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            bias=self.use_bn,
         )
         self.act = nn.Sigmoid()
 
     def forward(self, s: torch.Tensor) -> torch.Tensor:
-        return self.act(self.pwconv(self.dwconv(s)))
+        return self.act(self.pwconv(self.bn(self.dwconv(s))))
 
 
 class IllumRetinexGate(nn.Module):
     """
-    Post-Attention Feature-Space Retinex-Delta FiLM Gate conditioned on S_L via Multinex CWA.
-    Produces spatially-adaptive per-channel (scale, shift) where scale initializes near 1.0
-    and shift initializes near 0.0 to preserve pretrained COCO backbone features at epoch 0.
+    Post-Attention Feature-Space Retinex-Delta FiLM Gate conditioned on S_L via Multinex CWA (PA1-v2).
+
+    Improvements over PA1-v1:
+      - BatchNorm2d after `proj` and `refine_pw` unlocks spatial contrast in `scale_head` so
+        FiLM scale actively adapts between dark and bright regions instead of collapsing flat.
+      - Darkness-weighted additive shift (`(1 - Y_Rec709_log) * shift_head(feat)`) focuses
+        additive shadow-lifting on under-exposed regions and vanishes cleanly on bright glare.
     """
 
-    def __init__(self, illum_channels: int, dim: int, kernel_size: int = 7):
+    def __init__(
+        self,
+        illum_channels: int,
+        dim: int,
+        kernel_size: int = 7,
+        use_bn: bool = True,
+        darkness_weighted_shift: bool = True,
+    ):
         super().__init__()
+        self.use_bn = bool(use_bn)
+        self.darkness_weighted_shift = bool(darkness_weighted_shift)
         hidden = max(dim // 4, 16)
-        self.proj = nn.Conv2d(illum_channels, hidden, kernel_size=1, bias=True)
+
+        self.proj = nn.Conv2d(illum_channels, hidden, kernel_size=1, bias=not self.use_bn)
+        self.proj_bn = nn.BatchNorm2d(hidden) if self.use_bn else nn.Identity()
         self.proj_act = nn.SiLU()
-        self.cwa = ComponentWiseAttention(illum_channels, hidden, kernel_size=kernel_size)
+        self.cwa = ComponentWiseAttention(
+            illum_channels, hidden, kernel_size=kernel_size, use_bn=self.use_bn
+        )
         self.refine_dw = nn.Conv2d(
             hidden, hidden, kernel_size=3, stride=1, padding=1, groups=hidden, bias=True
         )
-        self.refine_pw = nn.Conv2d(hidden, hidden, kernel_size=1, bias=True)
+        self.refine_pw = nn.Conv2d(hidden, hidden, kernel_size=1, bias=not self.use_bn)
+        self.refine_bn = nn.BatchNorm2d(hidden) if self.use_bn else nn.Identity()
         self.refine_act = nn.SiLU()
         self.scale_head = nn.Conv2d(hidden, dim, kernel_size=1, bias=True)
         self.shift_head = nn.Conv2d(hidden, dim, kernel_size=1, bias=True)
 
         # Near-identity init with strong step-1 gradient flow (2 * sigmoid(0) = 1.0, shift ≈ 0.0)
-        nn.init.normal_(self.scale_head.weight, mean=0.0, std=0.05)
+        nn.init.normal_(self.scale_head.weight, mean=0.0, std=0.08 if self.use_bn else 0.05)
         nn.init.zeros_(self.scale_head.bias)
         nn.init.normal_(self.shift_head.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.shift_head.bias)
 
     def forward(self, illum: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        feat = self.proj_act(self.proj(illum))
+        feat = self.proj_act(self.proj_bn(self.proj(illum)))
         feat = feat * self.cwa(illum)
-        feat = self.refine_act(self.refine_pw(self.refine_dw(feat)))
+        feat = self.refine_act(self.refine_bn(self.refine_pw(self.refine_dw(feat))))
         scale = 2.0 * torch.sigmoid(self.scale_head(feat))
         shift = self.shift_head(feat)
+        if self.darkness_weighted_shift:
+            dark_mask = (1.0 - illum[:, 0:1]).clamp(0.0, 1.0)
+            shift = dark_mask * shift
         return scale, shift
 
 
 class IllumSAB(nn.Module):
     """
-    PA1: Multi-Prior CWA Illumination-Guided Transposed Channel Self-Attention Block (IllumSAB).
+    PA1-v2: Multi-Prior CWA Illumination-Guided Transposed Channel Self-Attention Block (IllumSAB).
 
-    Enhances Backbone P2 (160x160) SAB with Multinex's 4-channel analytic luminance stack S_L:
-      1. Pre-Attention Centered CWA Q/K Re-weighting:
+    Enhances Backbone P2 (160x160) SAB with Multinex's mu-law log-expanded 4-channel luminance stack:
+      1. Pre-Attention Centered CWA Q/K Re-weighting (with BN-unlocked CWA dynamic range):
          Modulates Q and K by `1 + 0.9 * tanh(illum_scale) * (2 * CWA(S_L) - 1)` in (0.1, 1.9),
-         allowing the network to simultaneously boost dark-region correlations and suppress
-         glaring light sources before spatial L2 normalization in transposed channel attention.
-      2. Post-Attention Retinex-Delta FiLM Gate (`IllumRetinexGate`):
-         Applies spatially-adaptive per-channel `(scale * out + shift)` before residual fusion
-         `x + gamma * out` (with `gamma_init=0.1` for smooth pretrained weight adaptation).
+         giving strong spatial contrast to simultaneously boost dark-region correlations and
+         suppress glaring lights before spatial L2 normalization (`illum_scale_init=0.3`).
+      2. Post-Attention Darkness-Weighted Retinex-Delta FiLM Gate (`IllumRetinexGate`):
+         Applies spatially-adaptive per-channel `(scale * out + (1 - Y_log) * shift)` before
+         residual fusion `x + gamma * out` (`gamma_init=0.1` for smooth COCO pretrained adaptation).
     """
 
     def __init__(
@@ -1223,7 +1274,9 @@ class IllumSAB(nn.Module):
         kv_dim: Optional[int] = None,
         gamma_init: float = 0.1,
         illum_channels: int = 4,
-        illum_scale_init: float = 0.5,
+        illum_scale_init: float = 0.3,
+        use_bn: bool = True,
+        darkness_weighted_shift: bool = True,
     ):
         super().__init__()
         inner_dim = max(dim // max(reduction, 1), num_heads)
@@ -1238,6 +1291,8 @@ class IllumSAB(nn.Module):
         self.num_heads = num_heads
         self.head_dim = inner_dim // num_heads
         self.illum_channels = illum_channels
+        self.use_bn = bool(use_bn)
+        self.darkness_weighted_shift = bool(darkness_weighted_shift)
 
         self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
         self.gamma = nn.Parameter(torch.full((1, dim, 1, 1), float(gamma_init)))
@@ -1258,8 +1313,16 @@ class IllumSAB(nn.Module):
             bias=bias,
         )
 
-        self.illum_qk_cwa = ComponentWiseAttention(illum_channels, inner_dim, kernel_size=7)
-        self.illum_gate = IllumRetinexGate(illum_channels, dim, kernel_size=7)
+        self.illum_qk_cwa = ComponentWiseAttention(
+            illum_channels, inner_dim, kernel_size=7, use_bn=self.use_bn
+        )
+        self.illum_gate = IllumRetinexGate(
+            illum_channels,
+            dim,
+            kernel_size=7,
+            use_bn=self.use_bn,
+            darkness_weighted_shift=self.darkness_weighted_shift,
+        )
 
         self.ffn_gate = nn.Sequential(
             nn.Conv2d(
