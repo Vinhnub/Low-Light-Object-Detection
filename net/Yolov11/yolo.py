@@ -52,6 +52,7 @@ from .common import (
     Focus,
     GhostBottleneck,
     GhostConv,
+    IllumConcat,
     IllumSAB,
     LightConv,
     MultiPriorIllumExtractor,
@@ -114,16 +115,16 @@ def get_yolov11_cfg_dict(
         ],
         "head": [
             [-1, 1, "nn.Upsample", [None, 2, "nearest"]],  # 12
-            [[-1, 7], 1, "Concat", [1]],                   # 13 cat backbone P4
+            [[-1, 7], 1, "IllumConcat", [1, True]],        # 13 IG-PAN fuse FPN P5_up(ctx) + P4(det)
             [-1, 2, "C3k2", [512, False]],                 # 14
             [-1, 1, "nn.Upsample", [None, 2, "nearest"]],  # 15
-            [[-1, 5], 1, "Concat", [1]],                   # 16 cat backbone P3
+            [[-1, 5], 1, "IllumConcat", [1, True]],        # 16 IG-PAN fuse FPN P4_up(ctx) + P3(det)
             [-1, 2, "C3k2", [256, False]],                 # 17 (P3/8-small)
             [-1, 1, "Conv", [256, 3, 2]],                  # 18
-            [[-1, 14], 1, "Concat", [1]],                  # 19 cat head P4
+            [[-1, 14], 1, "IllumConcat", [1, False]],      # 19 IG-PAN fuse PAN N3_down(det) + FPN_P4(ctx)
             [-1, 2, "C3k2", [512, False]],                 # 20 (P4/16-medium)
             [-1, 1, "Conv", [512, 3, 2]],                  # 21
-            [[-1, 11], 1, "Concat", [1]],                  # 22 cat head P5
+            [[-1, 11], 1, "IllumConcat", [1, False]],      # 22 IG-PAN fuse PAN N4_down(det) + P5(ctx)
             [-1, 2, "C3k2", [1024, True]],                 # 23 (P5/32-large)
             [[17, 20, 23], 1, "Detect", ["nc"]],           # 24 Detect(P3, P4, P5)
         ],
@@ -645,6 +646,7 @@ def parse_model(
         "SAB": SAB,
         "EdgeSAB": EdgeSAB,
         "IllumSAB": IllumSAB,
+        "IllumConcat": IllumConcat,
         "Concat": Concat,
         "Proto": Proto,
         "Detect": Detect,
@@ -684,6 +686,10 @@ def parse_model(
             args = [ch_list[f]]
         elif m is Concat:
             c2 = sum(ch_list[x] for x in f)
+        elif m is IllumConcat:
+            c_branches = [ch_list[x] for x in f]
+            c2 = sum(c_branches)
+            args = [c_branches[0], c_branches[1], *args]
         elif m in {SAB, EdgeSAB, IllumSAB}:
             c1 = ch_list[f] if isinstance(f, int) else ch_list[f[0]]
             c2 = c1
@@ -748,7 +754,7 @@ class BaseModel(nn.Module):
                 )
             if isinstance(m, EdgeSAB):
                 x = m(x, edge_map=edge_map)
-            elif isinstance(m, IllumSAB):
+            elif isinstance(m, (IllumSAB, IllumConcat)):
                 x = m(x, illum_map=illum_map)
             else:
                 x = m(x)
@@ -852,7 +858,7 @@ class DetectionModel(BaseModel):
         )
         self.illum_extractor = (
             MultiPriorIllumExtractor(in_channels=ch, downsample_stride=4, log_mu=20.0)
-            if any(isinstance(m, IllumSAB) for m in self.model)
+            if any(isinstance(m, (IllumSAB, IllumConcat)) for m in self.model)
             else None
         )
         self.names = [str(i) for i in range(self.yaml["nc"])]
@@ -1078,9 +1084,12 @@ class YOLOv11Backbone(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor
+        self,
+        x: torch.Tensor,
+        illum_map: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        illum_map = self.illum_extractor(x)       # Multi-Prior S_L at P2/4
+        if illum_map is None:
+            illum_map = self.illum_extractor(x)   # Multi-Prior S_L at P2/4
         x = self.stem(x)                          # P1/2
         x = self.stage1(x)                        # P2/4
         x = self.attn_p2(x, illum_map=illum_map)  # P2/4 IllumSAB (PA1)
@@ -1092,8 +1101,8 @@ class YOLOv11Backbone(nn.Module):
 
 class YOLOv11Neck(nn.Module):
     """
-    Explicit FPN + PAN Neck of YOLOv11 using C3k2 blocks.
-    Takes (P3, P4, P5) from YOLOv11Backbone and outputs fused [N3, N4, N5].
+    Explicit IG-PAN (Illumination-Guided FPN + PAN) Neck of YOLOv11 using IllumConcat + C3k2 blocks.
+    Takes (P3, P4, P5) from YOLOv11Backbone and optional Multi-Prior `illum_map`, outputting [N3, N4, N5].
     """
 
     def __init__(
@@ -1116,33 +1125,38 @@ class YOLOv11Neck(nn.Module):
         c5_out = c(1024)
         self.out_channels = (c3_out, c4_out, c5_out)
 
-        # Top-down FPN pathway
+        # Top-down FPN pathway (IG-PAN deep_first=True: x[0] is Deep Context, x[1] is Shallow Detail)
         self.upsample1 = nn.Upsample(scale_factor=2, mode="nearest")  # Layer 12
+        self.fuse_p4 = IllumConcat(c5, c4, d=1, deep_first=True)  # Layer 13
         self.c3k2_p4 = C3k2(c5 + c4, c4_fpn, n=d(2), c3k=c3k_override)  # Layer 14
 
         self.upsample2 = nn.Upsample(scale_factor=2, mode="nearest")  # Layer 15
+        self.fuse_p3 = IllumConcat(c4_fpn, c3, d=1, deep_first=True)  # Layer 16
         self.c3k2_p3 = C3k2(c4_fpn + c3, c3_out, n=d(2), c3k=c3k_override)  # Layer 17 (N3/8)
 
-        # Bottom-up PAN pathway
+        # Bottom-up PAN pathway (IG-PAN deep_first=False: x[0] is Shallow Detail, x[1] is Deep Context)
         self.down_p3 = Conv(c3_out, c3_out, k=3, s=2)  # Layer 18
+        self.fuse_n4 = IllumConcat(c3_out, c4_fpn, d=1, deep_first=False)  # Layer 19
         self.c3k2_n4 = C3k2(c3_out + c4_fpn, c4_out, n=d(2), c3k=c3k_override)  # Layer 20 (N4/16)
 
         self.down_p4 = Conv(c4_out, c4_out, k=3, s=2)  # Layer 21
+        self.fuse_n5 = IllumConcat(c4_out, c5, d=1, deep_first=False)  # Layer 22
         self.c3k2_n5 = C3k2(c4_out + c5, c5_out, n=d(2), c3k=True)  # Layer 23 (N5/32)
 
     def forward(
         self,
         features: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        illum_map: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         p3, p4, p5 = features
 
-        # Top-down FPN
-        f_p4 = self.c3k2_p4(torch.cat([self.upsample1(p5), p4], dim=1))
-        n3 = self.c3k2_p3(torch.cat([self.upsample2(f_p4), p3], dim=1))
+        # Top-down FPN with IG-PAN routing & glare suppression
+        f_p4 = self.c3k2_p4(self.fuse_p4([self.upsample1(p5), p4], illum_map=illum_map))
+        n3 = self.c3k2_p3(self.fuse_p3([self.upsample2(f_p4), p3], illum_map=illum_map))
 
-        # Bottom-up PAN
-        n4 = self.c3k2_n4(torch.cat([self.down_p3(n3), f_p4], dim=1))
-        n5 = self.c3k2_n5(torch.cat([self.down_p4(n4), p5], dim=1))
+        # Bottom-up PAN with IG-PAN routing & glare suppression
+        n4 = self.c3k2_n4(self.fuse_n4([self.down_p3(n3), f_p4], illum_map=illum_map))
+        n5 = self.c3k2_n5(self.fuse_n5([self.down_p4(n4), p5], illum_map=illum_map))
 
         return [n3, n4, n5]
 
@@ -1224,13 +1238,15 @@ class YOLOv11(nn.Module):
     def extract_features(
         self, x: torch.Tensor
     ) -> Tuple[Tuple[torch.Tensor, ...], List[torch.Tensor]]:
-        backbone_feats = self.backbone(x)
-        neck_feats = self.neck(backbone_feats)
+        illum_map = self.backbone.illum_extractor(x)
+        backbone_feats = self.backbone(x, illum_map=illum_map)
+        neck_feats = self.neck(backbone_feats, illum_map=illum_map)
         return backbone_feats, neck_feats
 
     def forward(self, x: torch.Tensor):
-        p3, p4, p5 = self.backbone(x)
-        neck_feats = self.neck((p3, p4, p5))
+        illum_map = self.backbone.illum_extractor(x)
+        p3, p4, p5 = self.backbone(x, illum_map=illum_map)
+        neck_feats = self.neck((p3, p4, p5), illum_map=illum_map)
         return self.head(neck_feats)
 
     def fuse(self):

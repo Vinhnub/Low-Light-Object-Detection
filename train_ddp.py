@@ -590,6 +590,7 @@ def set_backbone_trainable(net: torch.nn.Module, trainable: bool) -> None:
             if type(mod).__name__ in {
                 "EdgeSAB",
                 "IllumSAB",
+                "IllumConcat",
                 "SAB",
                 "EdgeExtractor",
                 "MultiPriorIllumExtractor",

@@ -13,7 +13,7 @@ Includes:
 
 import math
 import warnings
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -1166,9 +1166,11 @@ class ComponentWiseAttention(nn.Module):
         out_channels: int,
         kernel_size: int = 7,
         use_bn: bool = True,
+        padding_mode: str = "zeros",
     ):
         super().__init__()
         self.use_bn = bool(use_bn)
+        self.padding_mode = padding_mode
         padding = kernel_size // 2
         self.dwconv = nn.Conv2d(
             in_channels,
@@ -1176,6 +1178,7 @@ class ComponentWiseAttention(nn.Module):
             kernel_size=kernel_size,
             stride=1,
             padding=padding,
+            padding_mode=padding_mode,
             groups=in_channels,
             bias=not self.use_bn,
         )
@@ -1387,6 +1390,229 @@ class IllumSAB(nn.Module):
             out = out * scale + shift
 
         return x + self.gamma * out
+
+
+class IllumConcat(nn.Module):
+    """
+    IG-PAN: Illumination-Guided Complementary Neck Fusion (`IllumConcat`).
+
+    Replaces static `Concat` at YOLOv11 FPN+PAN junctions (L13, L16, L19, L22) while keeping
+    all 25 layer indices and `C3k2`/`Detect` channel dimensions 100% compatible with pretrained
+    COCO (`yolo11*.pt`) and `P2-IllumSAB` checkpoints.
+
+    At each multi-scale Neck junction `(80x80, 40x40, 20x20)`, `IllumConcat` fuses a Deep Semantic
+    Context branch (`f_ctx`) and a Shallow Spatial Detail branch (`f_det`) conditioned on the
+    anti-aliased 4-prior luminance stack `S_L = [Y_Rec709, V_MaxRGB, L_Lightness, E_EnergyL2]`:
+      1. Reflect-padded BN-unlocked Multinex CWA Illumination Encoder (`S_L -> h_il`), preserving
+         dataset-wide brightness awareness without zero-padding border artifacts.
+      2. Complementary Context-Detail Spatial Routing (`d_bal in (-1, +1)`):
+         - `M_ctx = 1 - alpha_ctx * d_bal` (amplifies top-down/deep semantic context in dark shadows)
+         - `M_det = 1 + alpha_det * d_bal - beta_glare * Y_glare * g_glare` (amplifies crisp shallow
+           edges in well-lit zones while damping streetlamp/headlight blooming halos on `f_det`).
+      3. Global Exposure-Aware Channel Recalibration (`W_ctx, W_det`), conditioned on global scene
+         exposure statistics and detached branch RMS balance without any feature shortcut collapse.
+    """
+
+    def __init__(
+        self,
+        c0: int,
+        c1: int,
+        d: int = 1,
+        deep_first: bool = True,
+        illum_channels: int = 4,
+        hidden_dim: int = 16,
+        kernel_size: int = 5,
+    ):
+        super().__init__()
+        self.c0 = int(c0)
+        self.c1 = int(c1)
+        self.d = int(d)
+        self.deep_first = bool(deep_first)
+        self.illum_channels = int(illum_channels)
+        self.hidden_dim = max(int(hidden_dim), 8)
+        self.kernel_size = int(kernel_size)
+
+        self.c_ctx = self.c0 if self.deep_first else self.c1
+        self.c_det = self.c1 if self.deep_first else self.c0
+        c_total = self.c_ctx + self.c_det
+        gap_dim = max(self.hidden_dim // 2, 4)
+
+        # 1. Reflect-padded BN-unlocked CWA Illumination Encoder
+        self.proj = nn.Conv2d(self.illum_channels, self.hidden_dim, kernel_size=1, bias=False)
+        self.proj_bn = nn.BatchNorm2d(self.hidden_dim)
+        self.proj_act = nn.SiLU()
+        self.cwa = ComponentWiseAttention(
+            self.illum_channels,
+            self.hidden_dim,
+            kernel_size=self.kernel_size,
+            use_bn=True,
+            padding_mode="reflect",
+        )
+        self.refine_dw = nn.Conv2d(
+            self.hidden_dim,
+            self.hidden_dim,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            padding_mode="reflect",
+            groups=self.hidden_dim,
+            bias=True,
+        )
+        self.refine_pw = nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=1, bias=False)
+        self.refine_bn = nn.BatchNorm2d(self.hidden_dim)
+        self.refine_act = nn.SiLU()
+
+        # 2. Spatial Routing & Glare Suppression Heads
+        self.spatial_heads = nn.Conv2d(self.hidden_dim, 2, kernel_size=1, bias=True)
+        self.route_ctx = nn.Parameter(torch.full((1, self.c_ctx, 1, 1), 0.25))
+        self.route_det = nn.Parameter(torch.full((1, self.c_det, 1, 1), 0.25))
+        self.glare_det = nn.Parameter(torch.full((1, self.c_det, 1, 1), -1.5))
+
+        # 3. Global Exposure-Aware Channel Recalibration
+        self.global_squeeze = nn.Sequential(
+            nn.Conv2d(self.hidden_dim, gap_dim, kernel_size=1, bias=True),
+            nn.SiLU(),
+        )
+        self.channel_head = nn.Conv2d(
+            gap_dim + self.illum_channels + 1, c_total, kernel_size=1, bias=True
+        )
+        self.gamma_cali = nn.Parameter(torch.full((1, c_total, 1, 1), 0.20))
+
+        # Near-identity initialization (<1% perturbation at Step 0 with active Step-1 gradients)
+        nn.init.normal_(self.spatial_heads.weight, mean=0.0, std=0.04)
+        with torch.no_grad():
+            self.spatial_heads.bias.copy_(torch.tensor([0.0, -1.5]))
+        nn.init.normal_(self.channel_head.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.channel_head.bias)
+
+    @staticmethod
+    def _pool_illum(illum_map: torch.Tensor, h: int, w: int, dtype: torch.dtype) -> torch.Tensor:
+        h0, w0 = illum_map.shape[-2:]
+        if (h0, w0) == (h, w):
+            s = illum_map
+        elif h0 >= h and w0 >= w and (h0 % h == 0) and (w0 % w == 0):
+            kh, kw = h0 // h, w0 // w
+            s = F.avg_pool2d(illum_map, kernel_size=(kh, kw), stride=(kh, kw))
+        else:
+            s = F.interpolate(illum_map, size=(h, w), mode="area")
+        return s.to(dtype=dtype)
+
+    @staticmethod
+    def _glare_prior(s: torch.Tensor) -> torch.Tensor:
+        # Combines high-intensity luminance energy (V_MaxRGB * E_EnergyL2) and saturated neon/brake
+        # chromatic highlight gap (V_MaxRGB * max(V_MaxRGB - L_Lightness, 0)); ~0 in dark shadows.
+        v_max = s[:, 1:2]
+        l_light = s[:, 2:3]
+        e_l2 = s[:, 3:4] if s.shape[1] >= 4 else v_max
+        chroma_gap = (v_max - l_light).clamp(0.0, 1.0)
+        return (0.70 * (v_max * e_l2) + 0.60 * (v_max * chroma_gap)).clamp(0.0, 1.0)
+
+    def _compute_modulation(
+        self,
+        f_ctx: torch.Tensor,
+        f_det: torch.Tensor,
+        illum_map: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        dtype = f_ctx.dtype
+        h, w = f_ctx.shape[-2:]
+        s = self._pool_illum(illum_map, h, w, dtype)
+
+        a_cwa = self.cwa(s)
+        feat = self.proj_act(self.proj_bn(self.proj(s)))
+        feat = feat * a_cwa
+        h_il = self.refine_act(self.refine_bn(self.refine_pw(self.refine_dw(feat))))
+
+        z_route, z_glare = self.spatial_heads(h_il).chunk(2, dim=1)
+        d_bal = 2.0 * torch.sigmoid(z_route) - 1.0
+        g_glare = torch.sigmoid(z_glare)
+        y_glare = self._glare_prior(s)
+        eff_glare = y_glare * g_glare
+
+        alpha_ctx = 0.8 * torch.tanh(self.route_ctx).to(dtype=dtype)
+        alpha_det = 0.8 * torch.tanh(self.route_det).to(dtype=dtype)
+        beta_glare = 0.8 * torch.sigmoid(self.glare_det).to(dtype=dtype)
+
+        m_ctx = 1.0 - alpha_ctx * d_bal
+        m_det = (1.0 + alpha_det * d_bal - beta_glare * eff_glare).clamp(min=0.05)
+
+        il_gap = self.global_squeeze(h_il.mean(dim=(-2, -1), keepdim=True))
+        with torch.no_grad():
+            rms_ctx = torch.sqrt(f_ctx.float().pow(2).mean(dim=(1, 2, 3), keepdim=True) + 1e-6)
+            rms_det = torch.sqrt(f_det.float().pow(2).mean(dim=(1, 2, 3), keepdim=True) + 1e-6)
+            bal_ratio = (rms_ctx / (rms_ctx + rms_det + 1e-6)).to(dtype=dtype)
+            s_gap = s.mean(dim=(-2, -1), keepdim=True)
+
+        g_vec = torch.cat([il_gap, s_gap, bal_ratio], dim=1)
+        ch_mod = torch.tanh(self.channel_head(g_vec))
+        gamma_c = 0.5 * torch.tanh(self.gamma_cali).to(dtype=dtype)
+        w_all = 1.0 + gamma_c * ch_mod
+        w_ctx, w_det = torch.split(w_all, [self.c_ctx, self.c_det], dim=1)
+
+        return {
+            "s": s,
+            "a_cwa": a_cwa,
+            "h_il": h_il,
+            "d_bal": d_bal,
+            "g_glare": g_glare,
+            "y_glare": y_glare,
+            "eff_glare": eff_glare,
+            "alpha_ctx": alpha_ctx,
+            "alpha_det": alpha_det,
+            "beta_glare": beta_glare,
+            "gamma_c": gamma_c,
+            "m_ctx": m_ctx,
+            "m_det": m_det,
+            "w_ctx": w_ctx,
+            "w_det": w_det,
+        }
+
+    def forward_with_diagnostics(
+        self,
+        x: Union[List[torch.Tensor], Tuple[torch.Tensor, ...]],
+        illum_map: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
+        if illum_map is None or len(x) != 2:
+            return torch.cat(list(x), self.d), None
+
+        if self.deep_first:
+            f_ctx, f_det = x[0], x[1]
+        else:
+            f_det, f_ctx = x[0], x[1]
+
+        mod = self._compute_modulation(f_ctx, f_det, illum_map)
+        f_ctx_out = f_ctx * mod["m_ctx"] * mod["w_ctx"]
+        f_det_out = f_det * mod["m_det"] * mod["w_det"]
+        out = (
+            torch.cat([f_ctx_out, f_det_out], self.d)
+            if self.deep_first
+            else torch.cat([f_det_out, f_ctx_out], self.d)
+        )
+        mod["f_ctx_in"] = f_ctx
+        mod["f_det_in"] = f_det
+        mod["f_ctx_out"] = f_ctx_out
+        mod["f_det_out"] = f_det_out
+        mod["out"] = out
+        return out, mod
+
+    def forward(
+        self,
+        x: Union[List[torch.Tensor], Tuple[torch.Tensor, ...]],
+        illum_map: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if illum_map is None or len(x) != 2:
+            return torch.cat(list(x), self.d)
+
+        if self.deep_first:
+            f_ctx, f_det = x[0], x[1]
+        else:
+            f_det, f_ctx = x[0], x[1]
+
+        mod = self._compute_modulation(f_ctx, f_det, illum_map)
+        f_ctx_out = f_ctx * mod["m_ctx"] * mod["w_ctx"]
+        f_det_out = f_det * mod["m_det"] * mod["w_det"]
+        if self.deep_first:
+            return torch.cat([f_ctx_out, f_det_out], self.d)
+        return torch.cat([f_det_out, f_ctx_out], self.d)
 
 
 class C3k2(C2f):

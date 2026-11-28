@@ -84,6 +84,7 @@ from tools.visualize_backbone_illumsab_yolov11 import (  # noqa: E402
     _extract_raw_sd,
     _infer_nc_from_sd,
     _infer_variant_from_sd,
+    _make_safe_run_tag,
     detect_ckpt_arch,
     detect_is_modular_ckpt as _detect_is_modular_sd,
 )
@@ -408,7 +409,7 @@ def load_yolov11_for_backbone(
     cfg_path = cfg_override if (cfg_override and os.path.exists(cfg_override)) else None
     detected_arch = detect_ckpt_arch(raw_sd) if raw_sd else None
 
-    if cfg_path is not None or is_modular or detected_arch in {None, "modular", "p2_illumsab"}:
+    if cfg_path is not None or is_modular or detected_arch in {None, "modular", "p2_illumsab_igpan"}:
         model = build_yolo_model(
             model_name=model_name,
             num_classes=nc,
@@ -666,7 +667,7 @@ def compute_spatial_projections(feat: torch.Tensor) -> Dict[str, Any]:
       - `pca_bgr`: Top-3 Principal Components projected to `[0, 255]` BGR `(H, W, 3)`
       - Quantitative statistics (`l2_mean`, `abs_mean`, `max_val`, `sparsity`)
     """
-    f = feat[0].float()  # (C, H, W)
+    f = feat[0].detach().float().cpu()  # (C, H, W)
     c, h, w = f.shape
     l2_map = torch.sqrt((f ** 2).mean(dim=0) + 1e-12).numpy()
     mean_map = f.mean(dim=0).numpy()
@@ -678,9 +679,9 @@ def compute_spatial_projections(feat: torch.Tensor) -> Dict[str, Any]:
     if min(h * w, c) >= 3 and float(flat_centered.std()) > 1e-8:
         try:
             u, s, _ = torch.pca_lowrank(flat_centered, q=min(6, c, h * w), center=False, niter=2)
-            proj = (u[:, :3] * s[:3]).numpy()  # (N_hw, 3)
+            proj = (u[:, :3] * s[:3]).cpu().numpy()  # (N_hw, 3)
         except Exception:
-            proj = flat_centered[:, :3].numpy()
+            proj = flat_centered[:, :3].cpu().numpy()
         # Deterministic sign convention so dominant foreground stays visually consistent
         for k in range(3):
             if float(np.percentile(proj[:, k], 95) + np.percentile(proj[:, k], 5)) < 0.0:
@@ -1441,11 +1442,12 @@ def main() -> None:
         recorder_b = YOLOv11BackboneRecorder(model_b, include_stem=args.include_stem)
 
     image_paths = collect_input_images(args.source, args.num, args.shuffle)
-    run_tag = (
+    raw_run_tag = (
         f"{model_name_a}_{meta_a['weights_label']}"
         if not args.compare_weights.strip()
         else f"compare_{meta_a['weights_label']}_vs_{meta_b['weights_label']}"
     )
+    run_tag = _make_safe_run_tag(raw_run_tag)
     out_root = Path(args.output) / run_tag
     out_root.mkdir(parents=True, exist_ok=True)
 

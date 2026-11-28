@@ -1,63 +1,44 @@
 """
 tools/visualize_backbone_illumsab_yolov11.py
 
-Visualize YOLOv11 Backbone multi-scale features (160 -> 80 -> 40 -> 20) together with
-full Backbone P2 (160x160) Multi-Prior CWA Illumination-Guided SAB (IllumSAB - PA1)
-internal diagnostics.
+Visualize YOLOv11 Backbone multi-scale features (160 -> 80 -> 40 -> 20), Backbone P2 (160x160)
+Multi-Prior CWA Illumination-Guided SAB (`IllumSAB` - PA1-v2), AND IG-PAN Illumination-Guided
+Neck Fusion (`IllumConcat` at L13, L16, L19, L22 -> Detection Head inputs N3/N4/N5).
 
-Tailored for the 25-layer `develop-yolov11-p2-illumsab` architecture (Backbone P2 160x160
-`IllumSAB` with Multinex 4-channel analytic luminance stack S_L, Pre-Attention centered CWA
-Q/K re-weighting, Post-Attention Retinex-Delta FiLM Gate, gamma_init=0.1):
+Tailored for the 25-layer `develop-yolov11-p2-illumsab-igpan` architecture:
   - Optional Stem  (P1/2,  320x320): L00_Stem_Conv3x3_P1_2 (via `--include_stem`)
   - Stage 1        (P2/4,  160x160): L01_Conv3x3_P2_4 -> L02_C3k2_P2_4 (Pre-IllumSAB) -> L03_IllumSAB_P2_4 (Post-IllumSAB)
   - Stage 2        (P3/8,   80x80 ): L04_Conv3x3_P3_8 -> L05_C3k2_P3_8 (Skip-P3)
   - Stage 3        (P4/16,  40x40 ): L06_Conv3x3_P4_16 -> L07_C3k2_P4_16 (Skip-P4)
   - Stage 4        (P5/32,  20x20 ): L08_Conv3x3_P5_32 -> L09_C3k2_P5_32 -> L10_SPPF_P5_32 -> L11_C2PSA_P5_32 (Skip-P5)
+  - IG-PAN Neck    (80/40/20)      : L13_IllumConcat_FPN_P4 -> L14_C3k2_FPN_P4
+                                     L16_IllumConcat_FPN_P3 -> L17_C3k2_Head_N3 (80x80 Small)
+                                     L19_IllumConcat_PAN_N4 -> L20_C3k2_Head_N4 (40x40 Medium)
+                                     L22_IllumConcat_PAN_N5 -> L23_C3k2_Head_N5 (20x20 Large)
 
-Also auto-detects other YOLOv11 ablation checkpoints (`base`, `p2_sab`, `p2_edgesab`,
-`skip_p3_sab`, `skip_p3_edgesab`, `p3_inline_edgesab`, `p3_prehead_edgesab`, `full_edgesab`,
-modular `YOLOv11`) so `--compare_weights` seamlessly compares PA1 against any baseline across
-semantic scales (160 -> 80 -> 40 -> 20).
+Also auto-detects all prior YOLOv11 ablation checkpoints (`p2_illumsab` PA1-v2, `p2_illumsab_v1`,
+`p2_sab`, `p2_edgesab`, `base`, `skip_p3_*`, `full_edgesab`, modular `YOLOv11`) so `--compare_weights`
+seamlessly compares IG-PAN against PA1-v2 or any baseline across both Backbone AND Neck Head inputs.
 
 Outputs saved under `<output>/<run_name>/<image_stem>/`:
-  - `00_backbone_pyramid_160_to_20.png`                   - Hero pyramid (Pre-IllumSAB 160 -> Post-IllumSAB 160 -> 80 -> 40 -> 20)
-  - `01_multinex_illumination_priors_and_cwa_160x160.png` - 4-ch S_L stack (Y_Rec.709, Y_vmax, Y_lightness, Y_L2),
-                                                            Y_vmax - Y_lightness gap, Pre-Attn CWA A_qk & W_qk,
-                                                            Post-Attn Retinex FiLM scale & ||shift||
-  - `02_p2_illumsab_internals_160x160.png`                - Full IllumSAB pipeline: Pre-L02 -> Raw Q -> Illum Q' -> V ->
-                                                            4-Head Channel Attn -> Pre-FiLM -> Post-FiLM -> |gamma*out| ->
-                                                            Signed Shift -> Post-L03
-  - `03_all_backbone_layers_160_to_20.png`                - Chronological progression across L01..L11 (Overlays + Native Grids)
-  - `04_attention_stages_p2_and_p5.png`                   - Dual Backbone Attention: P2 IllumSAB (160x160) & P5 C2PSA (20x20)
-  - `05_backbone_activation_stats.png`                    - Quantitative L2/Sparsity table + learned gamma chart +
-                                                            learned 0.9*tanh(illum_scale) chart + Dark/Mid/Bright regime table
-  - `06_backbone_comparison_160_to_20.png`                - Side-by-side semantic comparison & signed/abs delta (`--compare_weights`)
-  - `illum/`                                              - Standalone Multinex S_L, CWA, W_qk, FiLM scale/shift maps
-  - `illumsab/`                                           - Standalone IllumSAB Q/Q'/V/Attn/Residual/Gamma/Scale charts
-  - `layers/<layer_name>/`                                - Standalone maps + Top-K individual channel sheets
-
-Usage Examples:
-  # 1. Visualize trained YOLOv11s-P2-IllumSAB (PA1) checkpoint on an ExDark image
-  python tools/visualize_backbone_illumsab_yolov11.py ^
-      --weights model_results/yolov11s-p2-illumsab/best_mAP50.pth ^
-      --source dataset/ExDark/images/test/2015_00401.jpg --vis_gamma 0.65
-
-  # 2. Compare Pure P2-SAB vs P2-IllumSAB (PA1) across semantic stages (160 -> 80 -> 40 -> 20)
-  python tools/visualize_backbone_illumsab_yolov11.py ^
-      --weights model_results/yolov11s-p2-illumsab/best_mAP50.pth ^
-      --compare_weights model_results/yolov11s-p2-sab-advanced-training/best_mAP50.pth ^
-      --source dataset/ExDark/images/test/2015_00401.jpg --vis_gamma 0.65
-
-  # 3. Compare Base YOLOv11s vs P2-IllumSAB (PA1) on 5 random test images
-  python tools/visualize_backbone_illumsab_yolov11.py ^
-      --weights model_results/yolov11s-p2-illumsab/best_mAP50.pth ^
-      --compare_weights model_results/yolov11s/best_mAP50.pth ^
-      --source dataset/ExDark/images/test --num 5 --shuffle --vis_gamma 0.65
+  - `00_backbone_pyramid_160_to_20.png`                   - Hero Backbone pyramid (160 -> 80 -> 40 -> 20)
+  - `01_multinex_illumination_priors_and_cwa_160x160.png` - 4-ch S_L stack, CWA A_qk & W_qk, Retinex FiLM scale/shift
+  - `02_p2_illumsab_internals_160x160.png`                - Full Backbone P2 IllumSAB pipeline diagnostics
+  - `03_all_backbone_layers_160_to_20.png`                - Chronological Backbone progression across L01..L11
+  - `04_attention_stages_p2_and_p5.png`                   - Dual Backbone Attention: P2 IllumSAB (160) & P5 C2PSA (20)
+  - `05_backbone_activation_stats.png`                    - Backbone L2/Sparsity table + gamma + Dark/Mid/Bright regimes
+  - `06_backbone_comparison_160_to_20.png`                - Side-by-side Backbone comparison (`--compare_weights`)
+  - `07_igpan_neck_routing_and_glare_gates.png`           - 4x5 IG-PAN Neck routing `d_bal`, Context/Detail gains, Glare damping & Fused Neck maps
+  - `08_igpan_neck_pyramid_and_quant_stats.png`           - Head-Input Neck Pyramid (FPN-P4, N3, N4, N5) + IG-PAN learned params & Neck regime table
+  - `09_neck_head_comparison_80_to_20.png`                - Side-by-side Neck Head-Input L2 & PCA-RGB comparison (`--compare_weights`)
+  - `illum/`, `illumsab/`, `igpan/`, `layers/`            - Standalone borderless maps, charts, and Top-K channel sheets
 """
 
 import argparse
+import hashlib
 import math
 import os
+import re
 import sys
 from collections import OrderedDict
 from pathlib import Path
@@ -92,6 +73,7 @@ from net import (  # noqa: E402
 from net.Yolov11.common import (  # noqa: E402
     EdgeExtractor,
     EdgeSAB,
+    IllumConcat,
     IllumSAB,
     MultiPriorIllumExtractor,
     SAB,
@@ -121,6 +103,8 @@ STAGE_ACCENT_BGR: Dict[str, Tuple[int, int, int]] = {
     "p3_sab": (130, 255, 190),    # P3/8  (80) Legacy Skip-P3 SAB
     "p4": (55, 175, 255),         # P4/16 (40)
     "p5": (120, 95, 255),         # P5/32 (20)
+    "igpan": (80, 230, 255),      # IG-PAN Neck routing & fusion
+    "glare": (70, 120, 255),      # Glare suppression highlight
 }
 
 COLORMAP_TABLE: Dict[str, int] = {
@@ -141,6 +125,7 @@ BOX_PALETTE: List[Tuple[int, int, int]] = [
 
 SUPPORTED_ARCH_CHOICES = [
     "auto",
+    "p2_illumsab_igpan",
     "p2_illumsab",
     "p2_illumsab_v1",
     "p2_sab",
@@ -155,6 +140,17 @@ SUPPORTED_ARCH_CHOICES = [
     "p3_skip_inline_edgesab",
     "full_edgesab",
 ]
+
+
+def _make_safe_run_tag(raw_tag: str, max_len: int = 68) -> str:
+    """Sanitize and bound output folder tag length to prevent Windows MAX_PATH errors."""
+    clean = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_tag).strip("_")
+    if len(clean) <= max_len:
+        return clean
+    digest = hashlib.md5(clean.encode("utf-8")).hexdigest()[:8]
+    keep = max(24, max_len - 9)
+    half = keep // 2
+    return f"{clean[:half]}..{clean[-(keep - half):]}_{digest}"
 
 
 def str2bool(v: Any) -> bool:
@@ -459,6 +455,18 @@ def detect_ckpt_arch(sd: Dict[str, Any]) -> Optional[str]:
             for k in keys
         )
 
+    def _has_igpan_neck() -> bool:
+        return any(
+            k.startswith((
+                "model.13.spatial_heads.",
+                "model.16.spatial_heads.",
+                "model.19.spatial_heads.",
+                "model.22.spatial_heads.",
+                "neck.fuse_p4.spatial_heads.",
+            ))
+            for k in keys
+        )
+
     if _has_detect(26) and _has_sab(23):
         return "full_edgesab"
     if _has_detect(25) and _has_sab(3):
@@ -468,6 +476,8 @@ def detect_ckpt_arch(sd: Dict[str, Any]) -> Optional[str]:
     if _has_detect(24):
         if _has_sab(3):
             if _has_illum_gate(3):
+                if _has_igpan_neck():
+                    return "p2_illumsab_igpan"
                 return "p2_illumsab" if _has_illum_v2_bn(3) else "p2_illumsab_v1"
             if _has_edge_gate(3):
                 return "p2_edgesab"
@@ -488,8 +498,15 @@ def _build_arch_cfg_dict(model_name: str, nc: int, arch: str) -> Dict[str, Any]:
     variant = model_name.lower().replace("yolov11", "").replace("yolo11", "")
     scales = {k: list(v) for k, v in YOLOV11_SCALES.items()}
 
-    if arch in {"p2_illumsab", "p2_illumsab_v1", "p2_sab", "p2_edgesab", "p2_edgesab_skip_p3"}:
-        if arch == "p2_illumsab":
+    if arch in {
+        "p2_illumsab_igpan",
+        "p2_illumsab",
+        "p2_illumsab_v1",
+        "p2_sab",
+        "p2_edgesab",
+        "p2_edgesab_skip_p3",
+    }:
+        if arch in {"p2_illumsab_igpan", "p2_illumsab"}:
             p2_cls = "IllumSAB"
             p2_args = [4, False, 2]
         elif arch == "p2_illumsab_v1":
@@ -517,6 +534,23 @@ def _build_arch_cfg_dict(model_name: str, nc: int, arch: str) -> Dict[str, Any]:
             [-1, 1, "SPPF", [1024, 5]],
             [-1, 2, "C2PSA", [1024]],
         ]
+        if arch == "p2_illumsab_igpan":
+            head_igpan = [
+                [-1, 1, "nn.Upsample", [None, 2, "nearest"]],
+                [[-1, 7], 1, "IllumConcat", [1, True]],
+                [-1, 2, "C3k2", [512, False]],
+                [-1, 1, "nn.Upsample", [None, 2, "nearest"]],
+                [[-1, 5], 1, "IllumConcat", [1, True]],
+                [-1, 2, "C3k2", [256, False]],
+                [-1, 1, "Conv", [256, 3, 2]],
+                [[-1, 14], 1, "IllumConcat", [1, False]],
+                [-1, 2, "C3k2", [512, False]],
+                [-1, 1, "Conv", [512, 3, 2]],
+                [[-1, 11], 1, "IllumConcat", [1, False]],
+                [-1, 2, "C3k2", [1024, True]],
+                [[17, 20, 23], 1, "Detect", ["nc"]],
+            ]
+            return {"nc": nc, "scale": variant, "scales": scales, "backbone": backbone_p2, "head": head_igpan}
         if arch in {"p2_illumsab", "p2_illumsab_v1", "p2_sab", "p2_edgesab"}:
             head_25 = [
                 [-1, 1, "nn.Upsample", [None, 2, "nearest"]],
@@ -715,10 +749,10 @@ def load_yolov11_model(
         resolved_arch = (
             detected
             if detected in set(SUPPORTED_ARCH_CHOICES) - {"auto"}
-            else "p2_illumsab"
+            else "p2_illumsab_igpan"
         )
 
-    if cfg_path is not None or is_modular or resolved_arch == "p2_illumsab":
+    if cfg_path is not None or is_modular or resolved_arch == "p2_illumsab_igpan":
         model = build_yolo_model(
             model_name=model_name,
             num_classes=nc,
@@ -746,8 +780,12 @@ def load_yolov11_model(
     if not is_auto_or_none:
         p_obj = Path(w_str)
         parent_name = p_obj.parent.name
+        grandparent_name = p_obj.parent.parent.name if p_obj.parent.parent else ""
         if parent_name and parent_name.lower() not in {".", "weights", "pretrained", "training", "train"}:
-            w_label = f"{parent_name}_{p_obj.stem}"
+            if len(parent_name) <= 4 and grandparent_name and grandparent_name.lower() not in {".", "weights", "model_results"}:
+                w_label = f"{grandparent_name}_{parent_name}_{p_obj.stem}"
+            else:
+                w_label = f"{parent_name}_{p_obj.stem}"
         else:
             w_label = p_obj.stem
     else:
@@ -1069,10 +1107,151 @@ def inspect_p2_attn_internals(
     }
 
 
+@torch.no_grad()
+def inspect_igpan_neck_internals(
+    igpan_mods: "OrderedDict[str, Dict[str, Any]]",
+    igpan_inputs: Dict[str, List[torch.Tensor]],
+    neck_records: "OrderedDict[str, Dict[str, Any]]",
+    illum_tensor: Optional[torch.Tensor],
+    linear_illum_tensor: Optional[torch.Tensor],
+    lb_size: int = 640,
+    crop_box: Optional[Tuple[int, int, int, int]] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Step-by-step inspection of all 4 IG-PAN (`IllumConcat`) Neck junctions:
+      - L13 FPN-P4 (40x40): Deep P5_up (ctx) + Shallow P4 (det) -> L14 F_P4
+      - L16 FPN-P3 (80x80): Deep F_P4_up (ctx) + Shallow P3 (det) -> L17 Head-N3
+      - L19 PAN-N4 (40x40): Shallow N3_down (det) + Deep F_P4 (ctx) -> L20 Head-N4
+      - L22 PAN-N5 (20x20): Shallow N4_down (det) + Deep P5 (ctx) -> L23 Head-N5
+    """
+    if not igpan_mods or illum_tensor is None:
+        return None
+
+    junctions: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+    all_regimes: List[Dict[str, Any]] = []
+
+    for j_key, j_meta in igpan_mods.items():
+        mod: IllumConcat = j_meta["module"]
+        branch_in = igpan_inputs.get(j_key)
+        if not isinstance(mod, IllumConcat) or branch_in is None or len(branch_in) != 2:
+            continue
+
+        _, diag = mod.forward_with_diagnostics(branch_in, illum_map=illum_tensor)
+        if diag is None:
+            continue
+
+        _, _, h, w = diag["f_ctx_in"].shape
+        valid_mask = (
+            _build_valid_spatial_mask((h, w), lb_size, crop_box)
+            if crop_box is not None
+            else np.ones((h, w), dtype=bool)
+        )
+
+        # Effective spatial + channel gain maps per branch
+        gain_ctx_t = diag["m_ctx"] * diag["w_ctx"]
+        gain_det_t = diag["m_det"] * diag["w_det"]
+        glare_damp_t = diag["beta_glare"] * diag["eff_glare"]
+
+        cwa_mean = diag["a_cwa"][0].float().mean(dim=0).cpu().numpy()
+        d_bal_map = diag["d_bal"][0, 0].float().cpu().numpy()
+        y_glare_map = diag["y_glare"][0, 0].float().cpu().numpy()
+        eff_glare_map = diag["eff_glare"][0, 0].float().cpu().numpy()
+        glare_damp_map = glare_damp_t[0].float().mean(dim=0).cpu().numpy()
+        gain_ctx_map = gain_ctx_t[0].float().mean(dim=0).cpu().numpy()
+        gain_det_map = gain_det_t[0].float().mean(dim=0).cpu().numpy()
+
+        ctx_in_l2 = torch.sqrt((diag["f_ctx_in"][0].float() ** 2).mean(dim=0) + 1e-12).cpu().numpy()
+        ctx_out_l2 = torch.sqrt((diag["f_ctx_out"][0].float() ** 2).mean(dim=0) + 1e-12).cpu().numpy()
+        det_in_l2 = torch.sqrt((diag["f_det_in"][0].float() ** 2).mean(dim=0) + 1e-12).cpu().numpy()
+        det_out_l2 = torch.sqrt((diag["f_det_out"][0].float() ** 2).mean(dim=0) + 1e-12).cpu().numpy()
+
+        rms_ctx_out = float(np.sqrt(np.mean(ctx_out_l2[valid_mask] ** 2) + 1e-12))
+        rms_det_out = float(np.sqrt(np.mean(det_out_l2[valid_mask] ** 2) + 1e-12))
+        ctx_share_pct = 100.0 * rms_ctx_out / (rms_ctx_out + rms_det_out + 1e-8)
+
+        alpha_ctx_vec = diag["alpha_ctx"].detach().float().view(-1).cpu().numpy()
+        alpha_det_vec = diag["alpha_det"].detach().float().view(-1).cpu().numpy()
+        beta_glare_vec = diag["beta_glare"].detach().float().view(-1).cpu().numpy()
+        gamma_c_vec = diag["gamma_c"].detach().float().view(-1).cpu().numpy()
+
+        # Physical linear luminance at junction resolution for Dark / Mid / Bright regime stats
+        lin_y: Optional[np.ndarray] = None
+        if linear_illum_tensor is not None:
+            lin_s = IllumConcat._pool_illum(linear_illum_tensor, h, w, torch.float32)
+            lin_y = lin_s[0, 0].cpu().numpy()
+
+        post_slot = j_meta["post_slot"]
+        post_l2_map: Optional[np.ndarray] = None
+        if post_slot in neck_records:
+            pf = neck_records[post_slot]["tensor"][0].float()
+            post_l2_map = torch.sqrt((pf ** 2).mean(dim=0) + 1e-12).numpy()
+
+        j_regimes: List[Dict[str, Any]] = []
+        if lin_y is not None:
+            n_val = max(1, int(valid_mask.sum()))
+            for r_lbl, r_m in [
+                ("Dark (<0.15)", valid_mask & (lin_y < 0.15)),
+                ("Mid (0.15-0.50)", valid_mask & (lin_y >= 0.15) & (lin_y <= 0.50)),
+                ("Bright (>0.50)", valid_mask & (lin_y > 0.50)),
+            ]:
+                cnt = int(r_m.sum())
+                if cnt > 0:
+                    rec_stat = {
+                        "junction": j_meta["short_label"],
+                        "regime": r_lbl,
+                        "pct": 100.0 * cnt / n_val,
+                        "d_bal": float(d_bal_map[r_m].mean()),
+                        "gain_ctx": float(gain_ctx_map[r_m].mean()),
+                        "gain_det": float(gain_det_map[r_m].mean()),
+                        "glare_damp": float(glare_damp_map[r_m].mean()),
+                        "post_l2": float(post_l2_map[r_m].mean()) if post_l2_map is not None else float("nan"),
+                    }
+                    j_regimes.append(rec_stat)
+                    all_regimes.append(rec_stat)
+
+        junctions[j_key] = {
+            "key": j_key,
+            "layer_idx": j_meta["layer_idx"],
+            "short_label": j_meta["short_label"],
+            "title": j_meta["title"],
+            "post_slot": post_slot,
+            "stride": j_meta["stride"],
+            "deep_first": bool(mod.deep_first),
+            "hw": (h, w),
+            "c_ctx": int(mod.c_ctx),
+            "c_det": int(mod.c_det),
+            "cwa_mean": cwa_mean,
+            "d_bal_map": d_bal_map,
+            "y_glare_map": y_glare_map,
+            "eff_glare_map": eff_glare_map,
+            "glare_damp_map": glare_damp_map,
+            "gain_ctx_map": gain_ctx_map,
+            "gain_det_map": gain_det_map,
+            "ctx_delta_l2": ctx_out_l2 - ctx_in_l2,
+            "det_delta_l2": det_out_l2 - det_in_l2,
+            "d_bal_active_mean": float(d_bal_map[valid_mask].mean()),
+            "d_bal_active_std": float(d_bal_map[valid_mask].std()),
+            "gain_ctx_active_mean": float(gain_ctx_map[valid_mask].mean()),
+            "gain_det_active_mean": float(gain_det_map[valid_mask].mean()),
+            "glare_damp_max": float(glare_damp_map[valid_mask].max()),
+            "ctx_share_pct": ctx_share_pct,
+            "alpha_ctx_mean": float(alpha_ctx_vec.mean()),
+            "alpha_det_mean": float(alpha_det_vec.mean()),
+            "beta_glare_mean": float(beta_glare_vec.mean()),
+            "gamma_c_abs_mean": float(np.abs(gamma_c_vec).mean()),
+            "regimes": j_regimes,
+        }
+
+    if not junctions:
+        return None
+    return {"junctions": junctions, "all_regimes": all_regimes}
+
+
 class YOLOv11BackboneIllumSABRecorder:
     """
     Dynamically hooks YOLOv11 Backbone layers (L00..L11 for P2-IllumSAB / P2-SAB / P2-EdgeSAB,
-    or L00..L10 for Base / Skip-P3), capturing P2 input and Illumination/Edge extractors.
+    or L00..L10 for Base / Skip-P3), plus Neck post-fusion C3k2 outputs (`fpn_p4`, `n3`, `n4`, `n5`)
+    and IG-PAN `IllumConcat` junctions (`L13, L16, L19, L22`).
     """
 
     def __init__(self, model: nn.Module, include_stem: bool = False):
@@ -1080,6 +1259,9 @@ class YOLOv11BackboneIllumSABRecorder:
         self.include_stem = include_stem
         self.handles: List[Any] = []
         self.records: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self.neck_records: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self.igpan_mods: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self.igpan_inputs: Dict[str, List[torch.Tensor]] = {}
         self.edge_extractor_mod: Optional[EdgeExtractor] = getattr(self.model, "edge_extractor", None)
         self.illum_extractor_mod: Optional[MultiPriorIllumExtractor] = getattr(
             self.model, "illum_extractor", None
@@ -1090,6 +1272,7 @@ class YOLOv11BackboneIllumSABRecorder:
         self.p2_attn_input: Optional[torch.Tensor] = None
         self.skip_p3_sab_mod: Optional[nn.Module] = None
         self.stage_slots: Dict[str, str] = {}
+        self.neck_slots: Dict[str, str] = {}
         self.arch_display_tag: str = "Base"
         self._register()
 
@@ -1117,6 +1300,38 @@ class YOLOv11BackboneIllumSABRecorder:
                     "mod_type": type(module).__name__,
                     "tensor": output.detach().float().cpu(),
                 }
+
+        return hook_fn
+
+    def _make_neck_hook(
+        self,
+        slot: str,
+        key: str,
+        layer_idx: int,
+        stage_group: str,
+        stride: int,
+        accent_key: str,
+    ):
+        def hook_fn(module, inputs, output):
+            if isinstance(output, torch.Tensor):
+                self.neck_records[key] = {
+                    "slot": slot,
+                    "key": key,
+                    "layer_idx": layer_idx,
+                    "stage_group": stage_group,
+                    "stride": stride,
+                    "accent_key": accent_key,
+                    "is_stage_out": True,
+                    "mod_type": type(module).__name__,
+                    "tensor": output.detach().float().cpu(),
+                }
+
+        return hook_fn
+
+    def _make_igpan_hook(self, j_key: str):
+        def hook_fn(module, inputs, output):
+            if inputs and isinstance(inputs[0], (list, tuple)) and len(inputs[0]) == 2:
+                self.igpan_inputs[j_key] = [t.detach().clone() for t in inputs[0]]
 
         return hook_fn
 
@@ -1189,6 +1404,60 @@ class YOLOv11BackboneIllumSABRecorder:
                     if slot:
                         self.stage_slots[slot] = key
 
+            # Hook Neck Head-Input feature pyramids (FPN_P4, Head_N3, Head_N4, Head_N5) dynamically
+            det_f = getattr(layers[-1], "f", None) if layers else None
+            if isinstance(det_f, (list, tuple)) and len(det_f) == 3:
+                idx_n3, idx_n4, idx_n5 = int(det_f[0]), int(det_f[1]), int(det_f[2])
+                idx_fpn_p4 = -1
+                if 0 <= idx_n4 - 1 < len(layers):
+                    f_pan4 = getattr(layers[idx_n4 - 1], "f", None)
+                    if isinstance(f_pan4, (list, tuple)) and len(f_pan4) == 2 and int(f_pan4[1]) >= 0:
+                        idx_fpn_p4 = int(f_pan4[1])
+
+                neck_spec: List[Tuple[int, str, str, str, int, str]] = []
+                if 0 <= idx_fpn_p4 < len(layers):
+                    neck_spec.append((idx_fpn_p4, "fpn_p4", f"L{idx_fpn_p4:02d}_C3k2_FPN_P4_40", "FPN-P4 (40x40)", 16, "p4"))
+                neck_spec.extend([
+                    (idx_n3, "n3", f"L{idx_n3:02d}_Head_N3_80", "Head-N3 (80x80 Small)", 8, "p3"),
+                    (idx_n4, "n4", f"L{idx_n4:02d}_Head_N4_40", "Head-N4 (40x40 Med)", 16, "p4"),
+                    (idx_n5, "n5", f"L{idx_n5:02d}_Head_N5_20", "Head-N5 (20x20 Large)", 32, "p5"),
+                ])
+                for n_idx, n_slot, n_key, n_grp, n_s, n_acc in neck_spec:
+                    if 0 <= n_idx < len(layers):
+                        self.handles.append(
+                            layers[n_idx].register_forward_hook(
+                                self._make_neck_hook(n_slot, n_key, n_idx, n_grp, n_s, n_acc)
+                            )
+                        )
+                        self.neck_slots[n_slot] = n_key
+
+            # Hook IG-PAN IllumConcat junctions if present (L13, L16, L19, L22)
+            igpan_indices = [i for i, m in enumerate(layers) if isinstance(m, IllumConcat)]
+            if igpan_indices:
+                self.arch_display_tag = f"{self.arch_display_tag} + IG-PAN"
+                default_ig_meta = [
+                    ("fpn_p4", "FPN-P4 (40x40)", "L13 FPN-P4: P5_up(ctx) + P4(det)", 16),
+                    ("n3", "FPN-P3 (80x80)", "L16 FPN-P3: F_P4_up(ctx) + P3(det)", 8),
+                    ("n4", "PAN-N4 (40x40)", "L19 PAN-N4: N3_down(det) + F_P4(ctx)", 16),
+                    ("n5", "PAN-N5 (20x20)", "L22 PAN-N5: N4_down(det) + P5(ctx)", 32),
+                ]
+                for rank_i, l_idx in enumerate(igpan_indices):
+                    if rank_i < len(default_ig_meta):
+                        p_slot, s_lbl, full_t, st = default_ig_meta[rank_i]
+                        full_t = f"L{l_idx:02d} " + full_t.split(" ", 1)[1]
+                    else:
+                        p_slot, s_lbl, full_t, st = ("", f"L{l_idx:02d} IG", f"L{l_idx:02d} IllumConcat", 16)
+                    j_key = f"L{l_idx:02d}_{p_slot or rank_i}"
+                    self.igpan_mods[j_key] = {
+                        "layer_idx": l_idx,
+                        "post_slot": self.neck_slots.get(p_slot, ""),
+                        "short_label": f"L{l_idx:02d} {s_lbl}",
+                        "title": full_t,
+                        "stride": st,
+                        "module": layers[l_idx],
+                    }
+                    self.handles.append(layers[l_idx].register_forward_hook(self._make_igpan_hook(j_key)))
+
         elif hasattr(self.model, "backbone"):
             bb = self.model.backbone
             has_p2_attn = hasattr(bb, "attn_p2") and isinstance(bb.attn_p2, p2_types)
@@ -1242,11 +1511,53 @@ class YOLOv11BackboneIllumSABRecorder:
                 )
                 if slot:
                     self.stage_slots[slot] = key
+
+            if hasattr(self.model, "neck"):
+                nk = self.model.neck
+                mod_neck_spec = [
+                    (14, "fpn_p4", "L14_C3k2_FPN_P4_40", "FPN-P4 (40x40)", 16, "p4", getattr(nk, "c3k2_p4", None)),
+                    (17, "n3", "L17_Head_N3_80", "Head-N3 (80x80 Small)", 8, "p3", getattr(nk, "c3k2_p3", None)),
+                    (20, "n4", "L20_Head_N4_40", "Head-N4 (40x40 Med)", 16, "p4", getattr(nk, "c3k2_n4", None)),
+                    (23, "n5", "L23_Head_N5_20", "Head-N5 (20x20 Large)", 32, "p5", getattr(nk, "c3k2_n5", None)),
+                ]
+                for n_idx, n_slot, n_key, n_grp, n_s, n_acc, n_mod in mod_neck_spec:
+                    if isinstance(n_mod, nn.Module):
+                        self.handles.append(
+                            n_mod.register_forward_hook(
+                                self._make_neck_hook(n_slot, n_key, n_idx, n_grp, n_s, n_acc)
+                            )
+                        )
+                        self.neck_slots[n_slot] = n_key
+
+                mod_ig_spec = [
+                    (13, "fpn_p4", "L13 FPN-P4 (40x40)", "L13 FPN-P4: P5_up(ctx) + P4(det)", 16, getattr(nk, "fuse_p4", None)),
+                    (16, "n3", "L16 FPN-P3 (80x80)", "L16 FPN-P3: F_P4_up(ctx) + P3(det)", 8, getattr(nk, "fuse_p3", None)),
+                    (19, "n4", "L19 PAN-N4 (40x40)", "L19 PAN-N4: N3_down(det) + F_P4(ctx)", 16, getattr(nk, "fuse_n4", None)),
+                    (22, "n5", "L22 PAN-N5 (20x20)", "L22 PAN-N5: N4_down(det) + P5(ctx)", 32, getattr(nk, "fuse_n5", None)),
+                ]
+                has_mod_ig = False
+                for l_idx, p_slot, s_lbl, full_t, st, ig_mod in mod_ig_spec:
+                    if isinstance(ig_mod, IllumConcat):
+                        has_mod_ig = True
+                        j_key = f"L{l_idx:02d}_{p_slot}"
+                        self.igpan_mods[j_key] = {
+                            "layer_idx": l_idx,
+                            "post_slot": self.neck_slots.get(p_slot, ""),
+                            "short_label": s_lbl,
+                            "title": full_t,
+                            "stride": st,
+                            "module": ig_mod,
+                        }
+                        self.handles.append(ig_mod.register_forward_hook(self._make_igpan_hook(j_key)))
+                if has_mod_ig:
+                    self.arch_display_tag = f"{self.arch_display_tag} + IG-PAN"
         else:
             raise AttributeError("Unsupported YOLOv11 model structure (missing `.model` and `.backbone`).")
 
     def clear(self) -> None:
         self.records.clear()
+        self.neck_records.clear()
+        self.igpan_inputs.clear()
         self.p2_attn_input = None
 
     def close(self) -> None:
@@ -1352,7 +1663,7 @@ def normalize_map_to_uint8(
 
 
 def compute_spatial_projections(feat: torch.Tensor) -> Dict[str, Any]:
-    f = feat[0].float()
+    f = feat[0].detach().float().cpu()
     c, h, w = f.shape
     l2_map = torch.sqrt((f ** 2).mean(dim=0) + 1e-12).numpy()
     mean_map = f.mean(dim=0).numpy()
@@ -1363,9 +1674,9 @@ def compute_spatial_projections(feat: torch.Tensor) -> Dict[str, Any]:
     if min(h * w, c) >= 3 and float(flat_centered.std()) > 1e-8:
         try:
             u, s, _ = torch.pca_lowrank(flat_centered, q=min(6, c, h * w), center=False, niter=2)
-            proj = (u[:, :3] * s[:3]).numpy()
+            proj = (u[:, :3] * s[:3]).cpu().numpy()
         except Exception:
-            proj = flat_centered[:, :3].numpy()
+            proj = flat_centered[:, :3].cpu().numpy()
         for k in range(3):
             if float(np.percentile(proj[:, k], 95) + np.percentile(proj[:, k], 5)) < 0.0:
                 proj[:, k] = -proj[:, k]
@@ -1631,10 +1942,21 @@ def make_labeled_tile(
     cv2.rectangle(tile, (0, 0), (w - 1, header_h - 1), (30, 32, 38), -1)
     cv2.line(tile, (0, 0), (w - 1, 0), accent_bgr, 3)
     cv2.line(tile, (0, header_h - 1), (w - 1, header_h - 1), (62, 66, 76), 1)
+    max_w = max(40, w - 16)
     t_scale = min(0.45, max(0.28, w / 860.0))
+    while t_scale > 0.22:
+        (tw_px, _), _ = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, t_scale, 1)
+        if tw_px <= max_w:
+            break
+        t_scale -= 0.02
     cv2.putText(tile, title, (8, 18), cv2.FONT_HERSHEY_SIMPLEX, t_scale, (240, 244, 252), 1, cv2.LINE_AA)
     if subtitle:
         s_scale = min(0.35, max(0.24, w / 1060.0))
+        while s_scale > 0.20:
+            (sw_px, _), _ = cv2.getTextSize(subtitle, cv2.FONT_HERSHEY_SIMPLEX, s_scale, 1)
+            if sw_px <= max_w:
+                break
+            s_scale -= 0.02
         cv2.putText(tile, subtitle, (8, 36), cv2.FONT_HERSHEY_SIMPLEX, s_scale, (168, 178, 195), 1, cv2.LINE_AA)
     return tile
 
@@ -2514,8 +2836,15 @@ def build_stats_chart(
     cv2.rectangle(table, (0, 0), (width - 1, 62), (28, 30, 36), -1)
     cv2.line(table, (0, 62), (width - 1, 62), (80, 155, 255), 2)
     title_txt = f"YOLOv11 Backbone ({arch_tag}) Quantitative Diagnostics - {model_title}"
-    t_scale = min(0.58, max(0.40, (width - 40) / max(1, len(title_txt) * 13.0)))
-    cv2.putText(table, title_txt, (16, 28), cv2.FONT_HERSHEY_SIMPLEX, t_scale, (245, 248, 255), 2, cv2.LINE_AA)
+    t_scale = 0.58
+    t_thick = 2
+    while t_scale > 0.28:
+        t_thick = 2 if t_scale >= 0.45 else 1
+        (tw_px, _), _ = cv2.getTextSize(title_txt, cv2.FONT_HERSHEY_SIMPLEX, t_scale, t_thick)
+        if tw_px <= width - 32:
+            break
+        t_scale -= 0.02
+    cv2.putText(table, title_txt, (16, 28), cv2.FONT_HERSHEY_SIMPLEX, t_scale, (245, 248, 255), t_thick, cv2.LINE_AA)
 
     param_parts: List[str] = []
     if info is not None:
@@ -2702,6 +3031,368 @@ def build_semantic_comparison_figure(
     )
 
 
+def build_igpan_routing_and_glare_figure(
+    ref_panel: np.ndarray,
+    igpan_info: Dict[str, Any],
+    neck_records: "OrderedDict[str, Dict[str, Any]]",
+    neck_proj: Dict[str, Dict[str, Any]],
+    lb_size: int,
+    crop_box: Tuple[int, int, int, int],
+    colormap_id: int,
+    attn_colormap_id: int,
+    alpha: float,
+    clip_pct: float,
+    model_title: str,
+    igpan_out_dir: Optional[Path] = None,
+) -> Optional[np.ndarray]:
+    """
+    Create `07_igpan_neck_routing_and_glare_gates.png` (4 IG-PAN junctions x 5 diagnostic columns):
+      - Col 1: Complementary Routing Balance `d_bal` (Blue < 0 = Deep Context, Gold > 0 = Shallow Detail)
+      - Col 2: Deep Semantic Context Gain `M_ctx * W_ctx - 1` (Signed Diverging)
+      - Col 3: Shallow Spatial Detail Gain `M_det * W_det - 1` (Signed Diverging incl. Glare Damping)
+      - Col 4: Highlight Glare Suppression Mask `beta_glare * Y_glare * g_glare` (Inferno Heatmap)
+      - Col 5: Post-C3k2 Fused Neck Output (`F_P4`, `Head-N3`, `Head-N4`, `Head-N5` L2 Overlay)
+    """
+    junctions = igpan_info.get("junctions", {})
+    if not junctions:
+        return None
+    if igpan_out_dir is not None:
+        igpan_out_dir.mkdir(parents=True, exist_ok=True)
+
+    tiles: List[np.ndarray] = []
+    for j_key, jd in junctions.items():
+        h_f, w_f = jd["hw"]
+        lbl = jd["short_label"]
+
+        dbal_blend, _ = render_signed_diverging_map(
+            ref_panel, jd["d_bal_map"], lb_size, crop_box, clip_percentile=99.0, blend_alpha=0.78, min_limit=0.015
+        )
+        ctx_blend, _ = render_signed_diverging_map(
+            ref_panel, jd["gain_ctx_map"] - 1.0, lb_size, crop_box, clip_percentile=99.0, blend_alpha=0.78, min_limit=0.01
+        )
+        det_blend, _ = render_signed_diverging_map(
+            ref_panel, jd["gain_det_map"] - 1.0, lb_size, crop_box, clip_percentile=99.0, blend_alpha=0.78, min_limit=0.01
+        )
+        glare_ov, glare_heat, _ = render_views_for_map(
+            ref_panel, jd["glare_damp_map"], lb_size, crop_box, attn_colormap_id, alpha=0.68, clip_percentile=99.5
+        )
+
+        if igpan_out_dir is not None:
+            cv2.imwrite(str(igpan_out_dir / f"{j_key}_routing_dbal.png"), dbal_blend)
+            cv2.imwrite(str(igpan_out_dir / f"{j_key}_ctx_gain.png"), ctx_blend)
+            cv2.imwrite(str(igpan_out_dir / f"{j_key}_det_gain.png"), det_blend)
+            cv2.imwrite(str(igpan_out_dir / f"{j_key}_glare_suppression.png"), glare_heat)
+
+        tiles.append(
+            make_labeled_tile(
+                dbal_blend,
+                f"{lbl} Routing d_bal ({h_f}x{w_f})",
+                f"Blue=Ctx / Gold=Det | mean={jd['d_bal_active_mean']:+.3f} std={jd['d_bal_active_std']:.3f}",
+                STAGE_ACCENT_BGR["igpan"],
+            )
+        )
+        tiles.append(
+            make_labeled_tile(
+                ctx_blend,
+                f"{lbl} Deep Context Gain",
+                f"C_ctx={jd['c_ctx']} | Gain={jd['gain_ctx_active_mean']:.3f} | Share={jd['ctx_share_pct']:.1f}%",
+                STAGE_ACCENT_BGR["p4"],
+            )
+        )
+        tiles.append(
+            make_labeled_tile(
+                det_blend,
+                f"{lbl} Shallow Detail Gain",
+                f"C_det={jd['c_det']} | Gain={jd['gain_det_active_mean']:.3f} | a_det={jd['alpha_det_mean']:+.3f}",
+                STAGE_ACCENT_BGR["p3"],
+            )
+        )
+        tiles.append(
+            make_labeled_tile(
+                glare_ov,
+                f"{lbl} Glare Damping Mask",
+                f"beta*Y_gl*g_gl | peak={jd['glare_damp_max']:.3f} | beta={jd['beta_glare_mean']:.3f}",
+                STAGE_ACCENT_BGR["glare"],
+            )
+        )
+
+        post_slot = jd["post_slot"]
+        if post_slot in neck_records and post_slot in neck_proj:
+            n_rec = neck_records[post_slot]
+            n_prj = neck_proj[post_slot]
+            ov_post, _, _ = render_views_for_map(
+                ref_panel, n_prj["l2"], lb_size, crop_box, colormap_id, alpha=alpha, clip_percentile=clip_pct
+            )
+            tiles.append(
+                make_labeled_tile(
+                    ov_post,
+                    f"Post L{n_rec['layer_idx']:02d} C3k2 ({h_f}x{w_f})",
+                    f"{n_rec['stage_group']} | C={n_prj['shape'][0]} | L2={n_prj['l2_mean']:.4f}",
+                    STAGE_ACCENT_BGR.get(n_rec["accent_key"], (90, 210, 255)),
+                )
+            )
+        else:
+            tiles.append(make_labeled_tile(ref_panel, f"{lbl} Fused Out", "N/A", (100, 110, 125)))
+
+    return assemble_grid(
+        tiles,
+        ncols=5,
+        banner_title=f"IG-PAN Neck Illumination Routing & Glare Suppression Diagnostics - {model_title}",
+        banner_sub=(
+            "Col 1: Routing d_bal (Blue=Deep Ctx, Gold=Shallow Det) | Col 2: Context Gain | "
+            "Col 3: Detail Gain | Col 4: Glare Damping | Col 5: Post-C3k2 Neck Feature"
+        ),
+        colormap_id=colormap_id,
+    )
+
+
+def _render_igpan_quant_dashboard(igpan_info: Dict[str, Any], width: int) -> np.ndarray:
+    """Render quantitative IG-PAN parameter table + Dark/Mid/Bright Neck regime breakdown."""
+    junctions = list(igpan_info.get("junctions", {}).values())
+    row_h = 34
+    n_j = len(junctions)
+    h_top = 86 + n_j * row_h
+    h_reg = 74 + n_j * 3 * 26 + 24
+    total_h = h_top + h_reg
+    panel = np.full((total_h, width, 3), (18, 20, 24), dtype=np.uint8)
+
+    # Section A: Learned IG-PAN Junction Parameters & Branch Energy Balance
+    cv2.rectangle(panel, (10, 8), (width - 10, h_top - 6), (24, 27, 33), -1)
+    cv2.rectangle(panel, (10, 8), (width - 10, h_top - 6), (52, 58, 70), 1)
+    cv2.putText(
+        panel,
+        "IG-PAN Learned Junction Parameters & Branch Energy Balance (L13, L16, L19, L22)",
+        (22, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (240, 245, 255), 1, cv2.LINE_AA,
+    )
+
+    cols_a = [
+        ("Junction / Flow", 24),
+        ("(C_ctx, C_det, HxW)", 330),
+        ("alpha_ctx", 535),
+        ("alpha_det", 650),
+        ("beta_glare", 765),
+        ("|gamma_cali|", 890),
+        ("Mean d_bal", 1025),
+        ("Ctx Share%", 1165),
+        ("Peak Glare Damp", 1305),
+    ]
+    scale_x = max(0.72, min(1.15, (width - 40) / 1480.0))
+    cv2.rectangle(panel, (12, 40), (width - 12, 66), (32, 36, 45), -1)
+    for c_txt, cx in cols_a:
+        px = int(round(cx * scale_x))
+        if px < width - 70:
+            cv2.putText(panel, c_txt, (px, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (185, 200, 222), 1, cv2.LINE_AA)
+
+    for idx, jd in enumerate(junctions):
+        ry = 70 + idx * row_h
+        if idx % 2 == 0:
+            cv2.rectangle(panel, (14, ry), (width - 14, ry + row_h - 3), (28, 31, 39), -1)
+        h_f, w_f = jd["hw"]
+        vals = [
+            (jd["title"], 24, (85, 225, 255)),
+            (f"({jd['c_ctx']}, {jd['c_det']}, {h_f}x{w_f})", 330, (205, 214, 228)),
+            (f"{jd['alpha_ctx_mean']:+.4f}", 535, (140, 200, 255)),
+            (f"{jd['alpha_det_mean']:+.4f}", 650, (120, 235, 155)),
+            (f"{jd['beta_glare_mean']:.4f}", 765, (110, 150, 255)),
+            (f"{jd['gamma_c_abs_mean']:.4f}", 890, (225, 205, 145)),
+            (f"{jd['d_bal_active_mean']:+.4f}", 1025, (240, 244, 252)),
+            (f"{jd['ctx_share_pct']:5.1f}%", 1165, (95, 225, 245)),
+            (f"{jd['glare_damp_max']:.4f}", 1305, (120, 165, 255)),
+        ]
+        for v_txt, vx, v_col in vals:
+            px = int(round(vx * scale_x))
+            if px < width - 60:
+                cv2.putText(panel, v_txt, (px, ry + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.36, v_col, 1, cv2.LINE_AA)
+
+    # Section B: Dark / Mid / Bright Neck Regime Behavior across Junctions
+    y_b = h_top + 4
+    cv2.rectangle(panel, (10, y_b), (width - 10, total_h - 10), (24, 27, 33), -1)
+    cv2.rectangle(panel, (10, y_b), (width - 10, total_h - 10), (52, 58, 70), 1)
+    cv2.putText(
+        panel,
+        "Active-Pixel Neck Illumination Regimes (Physical Linear Y_Rec.709: Dark <0.15 | Mid 0.15-0.50 | Bright >0.50)",
+        (22, y_b + 23), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (235, 242, 252), 1, cv2.LINE_AA,
+    )
+
+    cols_b = [
+        ("Junction", 24),
+        ("Regime (Y_709)", 235),
+        ("Area%", 430),
+        ("Routing d_bal", 545),
+        ("Ctx Gain (M*W)", 705),
+        ("Det Gain (M*W)", 875),
+        ("Glare Damp", 1050),
+        ("Post-C3k2 L2", 1215),
+    ]
+    cv2.rectangle(panel, (12, y_b + 33), (width - 12, y_b + 58), (32, 36, 45), -1)
+    for c_txt, cx in cols_b:
+        px = int(round(cx * scale_x))
+        if px < width - 70:
+            cv2.putText(panel, c_txt, (px, y_b + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (185, 200, 222), 1, cv2.LINE_AA)
+
+    ry = y_b + 62
+    for reg in igpan_info.get("all_regimes", []):
+        r_name = reg["regime"]
+        r_col = (145, 200, 255) if "Dark" in r_name else ((215, 222, 232) if "Mid" in r_name else (95, 225, 255))
+        post_s = f"{reg['post_l2']:.4f}" if not math.isnan(reg["post_l2"]) else "  -  "
+        vals_b = [
+            (reg["junction"], 24, (200, 225, 245)),
+            (r_name, 235, r_col),
+            (f"{reg['pct']:5.1f}%", 430, (210, 218, 230)),
+            (f"{reg['d_bal']:+.4f}", 545, (110, 235, 220)),
+            (f"{reg['gain_ctx']:.4f}", 705, (135, 195, 255)),
+            (f"{reg['gain_det']:.4f}", 875, (125, 235, 160)),
+            (f"{reg['glare_damp']:.4f}", 1050, (125, 160, 255)),
+            (post_s, 1215, (235, 240, 248)),
+        ]
+        for v_txt, vx, v_col in vals_b:
+            px = int(round(vx * scale_x))
+            if px < width - 60:
+                cv2.putText(panel, v_txt, (px, ry + 17), cv2.FONT_HERSHEY_SIMPLEX, 0.34, v_col, 1, cv2.LINE_AA)
+        ry += 26
+
+    return panel
+
+
+def build_neck_pyramid_and_stats_figure(
+    raw_panel: np.ndarray,
+    det_panel: np.ndarray,
+    ref_panel: np.ndarray,
+    neck_records: "OrderedDict[str, Dict[str, Any]]",
+    neck_proj: Dict[str, Dict[str, Any]],
+    neck_slots: Dict[str, str],
+    igpan_info: Optional[Dict[str, Any]],
+    lb_size: int,
+    crop_box: Tuple[int, int, int, int],
+    colormap_id: int,
+    alpha: float,
+    clip_pct: float,
+    model_title: str,
+    img_name: str,
+) -> Optional[np.ndarray]:
+    """
+    Create `08_igpan_neck_pyramid_and_quant_stats.png`:
+      - Top pyramid: FPN-P4 (40x40) -> Head-N3 (80x80) -> Head-N4 (40x40) -> Head-N5 (20x20)
+                     across L2 Overlay, Native Grid, and Top-3 PCA Semantic RGB.
+      - Bottom dashboard (for IG-PAN): Learned junction params & Dark/Mid/Bright Neck regime table.
+    """
+    ordered_keys = [neck_slots[s] for s in ("fpn_p4", "n3", "n4", "n5") if s in neck_slots and neck_slots[s] in neck_records]
+    if not ordered_keys:
+        return None
+
+    ph, pw = ref_panel.shape[:2]
+    row1 = [make_labeled_tile(raw_panel, "Input (Raw Low-Light)", img_name, (130, 140, 155))]
+    row2 = [make_labeled_tile(ref_panel, "Display Underlay", "Gamma-adjusted reference", (170, 185, 205))]
+    row3 = [make_labeled_tile(det_panel, "Predictions / GT", "Final Detect(N3, N4, N5)", (80, 220, 120))]
+
+    for nk in ordered_keys:
+        rec = neck_records[nk]
+        prj = neck_proj[nk]
+        c, h_f, w_f = prj["shape"]
+        acc = STAGE_ACCENT_BGR.get(rec["accent_key"], (90, 185, 255))
+        ov_bgr, _, nat_bgr = render_views_for_map(
+            ref_panel, prj["l2"], lb_size, crop_box, colormap_id, alpha=alpha, clip_percentile=clip_pct
+        )
+        pca_bgr = unpad_and_resize_bgr(prj["pca_bgr"], lb_size, crop_box, (pw, ph), nearest=True)
+
+        row1.append(
+            make_labeled_tile(
+                ov_bgr,
+                f"L{rec['layer_idx']:02d} {rec['stage_group']} [Overlay]",
+                f"C={c} | L2={prj['l2_mean']:.4f} | Max={prj['max_val']:.2f}",
+                acc,
+            )
+        )
+        row2.append(
+            make_labeled_tile(
+                nat_bgr,
+                f"L{rec['layer_idx']:02d} Native Grid ({h_f}x{w_f})",
+                f"Stride {rec['stride']} | Sparsity={prj['sparsity']:.1f}%",
+                acc,
+            )
+        )
+        row3.append(
+            make_labeled_tile(
+                pca_bgr,
+                f"L{rec['layer_idx']:02d} PCA-RGB ({h_f}x{w_f})",
+                f"Semantic class subspace ({c}->3 RGB)",
+                acc,
+            )
+        )
+
+    grid = assemble_grid(
+        row1 + row2 + row3,
+        ncols=1 + len(ordered_keys),
+        banner_title=f"YOLOv11 Neck & Head-Input Pyramid (FPN-P4 -> N3 80 -> N4 40 -> N5 20) - {model_title}",
+        banner_sub="Row 1: L2 Energy Overlay | Row 2: Discrete Native Grid | Row 3: Top-3 PCA Semantic Foreground Separation",
+        colormap_id=colormap_id,
+    )
+    if igpan_info is not None:
+        dash = _render_igpan_quant_dashboard(igpan_info, width=grid.shape[1])
+        return np.vstack([grid, dash])
+    return grid
+
+
+def build_neck_comparison_figure(
+    ref_panel: np.ndarray,
+    neck_rec_a: "OrderedDict[str, Dict[str, Any]]",
+    neck_proj_a: Dict[str, Dict[str, Any]],
+    neck_slots_a: Dict[str, str],
+    label_a: str,
+    neck_rec_b: "OrderedDict[str, Dict[str, Any]]",
+    neck_proj_b: Dict[str, Dict[str, Any]],
+    neck_slots_b: Dict[str, str],
+    label_b: str,
+    lb_size: int,
+    crop_box: Tuple[int, int, int, int],
+    colormap_id: int,
+    alpha: float,
+    clip_pct: float,
+) -> Optional[np.ndarray]:
+    """
+    Create `09_neck_head_comparison_80_to_20.png`:
+      Compare Detection Head inputs (`FPN-P4 40x40`, `N3 80x80`, `N4 40x40`, `N5 20x20`)
+      across both L2 Energy and Top-3 PCA Semantic RGB between Model A and Model B.
+    """
+    common = [s for s in ("fpn_p4", "n3", "n4", "n5") if s in neck_slots_a and s in neck_slots_b]
+    if not common:
+        return None
+
+    ph, pw = ref_panel.shape[:2]
+    row_l2_a, row_l2_b, row_pca_a, row_pca_b, row_signed = [], [], [], [], []
+    for slot in common:
+        ka, kb = neck_slots_a[slot], neck_slots_b[slot]
+        ra, rb = neck_rec_a[ka], neck_rec_b[kb]
+        pa, pb = neck_proj_a[ka], neck_proj_b[kb]
+        _, h_f, w_f = pa["shape"]
+        acc = STAGE_ACCENT_BGR.get(ra["accent_key"], (85, 190, 255))
+
+        vmax = max(float(np.percentile(pa["l2"], clip_pct)), float(np.percentile(pb["l2"], clip_pct)), 1e-6)
+        vmin = min(float(pa["l2"].min()), float(pb["l2"].min()))
+        ov_a, _, _ = render_views_for_map(ref_panel, pa["l2"], lb_size, crop_box, colormap_id, alpha=alpha, fixed_range=(vmin, vmax))
+        ov_b, _, _ = render_views_for_map(ref_panel, pb["l2"], lb_size, crop_box, colormap_id, alpha=alpha, fixed_range=(vmin, vmax))
+        pca_a = unpad_and_resize_bgr(pa["pca_bgr"], lb_size, crop_box, (pw, ph), nearest=True)
+        pca_b = unpad_and_resize_bgr(pb["pca_bgr"], lb_size, crop_box, (pw, ph), nearest=True)
+
+        signed_2d = pb["l2"] - pa["l2"]
+        signed_blend, _ = render_signed_diverging_map(ref_panel, signed_2d, lb_size, crop_box, clip_percentile=99.0, blend_alpha=0.78)
+
+        slot_lbl = slot.upper()
+        row_l2_a.append(make_labeled_tile(ov_a, f"[A] {slot_lbl} L{ra['layer_idx']:02d} ({h_f}x{w_f})", f"{label_a} | L2={pa['l2_mean']:.4f}", acc))
+        row_l2_b.append(make_labeled_tile(ov_b, f"[B] {slot_lbl} L{rb['layer_idx']:02d} ({h_f}x{w_f})", f"{label_b} | L2={pb['l2_mean']:.4f}", (90, 230, 130)))
+        row_pca_a.append(make_labeled_tile(pca_a, f"[A] {slot_lbl} PCA-RGB ({h_f}x{w_f})", f"{label_a} semantic separation", acc))
+        row_pca_b.append(make_labeled_tile(pca_b, f"[B] {slot_lbl} PCA-RGB ({h_f}x{w_f})", f"{label_b} semantic separation", (90, 230, 130)))
+        row_signed.append(make_labeled_tile(signed_blend, f"Signed L2(B - A) {slot_lbl}", f"Blue(A>B)/Gold(B>A) | mean={float(signed_2d.mean()):+.4f}", (110, 175, 255)))
+
+    return assemble_grid(
+        row_l2_a + row_l2_b + row_pca_a + row_pca_b + row_signed,
+        ncols=len(common),
+        banner_title=f"Neck & Head-Input Comparison (FPN-P4, N3, N4, N5): [A] {label_a} vs [B] {label_b}",
+        banner_sub="Rows 1-2: Shared-Scale L2 Overlay | Rows 3-4: Top-3 PCA Semantic RGB | Row 5: Signed L2(B) - L2(A)",
+        colormap_id=colormap_id,
+    )
+
+
 # ==================================================================================================
 # 5. Main Pipeline
 # ==================================================================================================
@@ -2720,6 +3411,9 @@ def run_inference_and_record(
 ) -> Tuple[
     "OrderedDict[str, Dict[str, Any]]",
     Dict[str, Dict[str, Any]],
+    "OrderedDict[str, Dict[str, Any]]",
+    Dict[str, Dict[str, Any]],
+    Optional[Dict[str, Any]],
     Optional[Dict[str, Any]],
     np.ndarray,
 ]:
@@ -2728,11 +3422,15 @@ def run_inference_and_record(
         out = model(inp_tensor)
         pred_raw = out[0] if isinstance(out, tuple) else out
 
-    p2_info: Optional[Dict[str, Any]] = None
-    if recorder.p2_attn_mod is not None and recorder.p2_attn_input is not None:
-        il_mod = recorder.illum_extractor_mod or fallback_illum_extractor
+    il_mod = recorder.illum_extractor_mod or fallback_illum_extractor
+    illum_tensor: Optional[torch.Tensor] = None
+    linear_illum_tensor: Optional[torch.Tensor] = None
+    if recorder.p2_attn_mod is not None or recorder.igpan_mods:
         illum_tensor = il_mod(inp_tensor)
         linear_illum_tensor = il_mod.extract_linear(inp_tensor)
+
+    p2_info: Optional[Dict[str, Any]] = None
+    if recorder.p2_attn_mod is not None and recorder.p2_attn_input is not None:
         log_mu = float(getattr(il_mod, "log_mu", 0.0))
         edge_tensor = (
             recorder.edge_extractor_mod(inp_tensor)
@@ -2768,7 +3466,22 @@ def run_inference_and_record(
         (k, dict(v)) for k, v in recorder.records.items()
     )
     projections = {k: compute_spatial_projections(v["tensor"]) for k, v in records_copy.items()}
-    return records_copy, projections, p2_info, dets_np
+
+    neck_records_copy: "OrderedDict[str, Dict[str, Any]]" = OrderedDict(
+        (k, dict(v)) for k, v in recorder.neck_records.items()
+    )
+    neck_projections = {k: compute_spatial_projections(v["tensor"]) for k, v in neck_records_copy.items()}
+
+    igpan_info = inspect_igpan_neck_internals(
+        recorder.igpan_mods,
+        recorder.igpan_inputs,
+        neck_records_copy,
+        illum_tensor=illum_tensor,
+        linear_illum_tensor=linear_illum_tensor,
+        lb_size=lb_size,
+        crop_box=crop_box,
+    )
+    return records_copy, projections, neck_records_copy, neck_projections, p2_info, igpan_info, dets_np
 
 
 def _print_regime_summary(stem: str, info: Dict[str, Any]) -> None:
@@ -2786,6 +3499,20 @@ def _print_regime_summary(stem: str, info: Dict[str, Any]) -> None:
         print(
             f"      {reg['name']:<15} {reg['pct']:5.1f}%  {w_s:>6}  {fs_s:>7}  {sh_s:>6}  "
             f"{reg['pre_l2']:6.3f}  {reg['post_l2']:7.3f}  {reg['delta_l2']:+6.3f}   {reg['boost_pct']:5.1f}%"
+        )
+
+
+def _print_igpan_summary(stem: str, igpan_info: Dict[str, Any]) -> None:
+    junctions = igpan_info.get("junctions", {})
+    if not junctions:
+        return
+    print(f"    [IG-PAN Neck Analysis - {stem}]")
+    print("      Junction                a_ctx    a_det   b_glare  |g_cal|   d_bal   CtxGain  DetGain  CtxShare")
+    for jd in junctions.values():
+        print(
+            f"      {jd['short_label']:<21} {jd['alpha_ctx_mean']:+7.4f}  {jd['alpha_det_mean']:+7.4f}   "
+            f"{jd['beta_glare_mean']:6.4f}   {jd['gamma_c_abs_mean']:6.4f}  {jd['d_bal_active_mean']:+6.3f}    "
+            f"{jd['gain_ctx_active_mean']:6.3f}   {jd['gain_det_active_mean']:6.3f}    {jd['ctx_share_pct']:5.1f}%"
         )
 
 
@@ -2822,11 +3549,12 @@ def main() -> None:
         recorder_b = YOLOv11BackboneIllumSABRecorder(model_b, include_stem=args.include_stem)
 
     image_paths = collect_input_images(args.source, args.num, args.shuffle)
-    run_tag = (
+    raw_run_tag = (
         f"{model_name_a}_{meta_a['weights_label']}"
         if not args.compare_weights.strip()
         else f"compare_{meta_a['weights_label']}_vs_{meta_b['weights_label']}"
     )
+    run_tag = _make_safe_run_tag(raw_run_tag)
     out_root = Path(args.output) / run_tag
     out_root.mkdir(parents=True, exist_ok=True)
     print(
@@ -2849,7 +3577,7 @@ def main() -> None:
             inp_tensor, crop_box, ratio_pad = preprocess_image(img_bgr, img_size=args.imgsz)
             inp_tensor = inp_tensor.to(device)
 
-            records_a, proj_a, info_a, dets_a = run_inference_and_record(
+            records_a, proj_a, neck_rec_a, neck_proj_a, info_a, igpan_a, dets_a = run_inference_and_record(
                 model_a, recorder_a, inp_tensor, orig_hw, ratio_pad, crop_box,
                 args.imgsz, args.conf_thres, args.iou_thres, fallback_illum_ext,
             )
@@ -2925,7 +3653,7 @@ def main() -> None:
             )
             cv2.imwrite(str(img_out_dir / "05_backbone_activation_stats.png"), fig5)
 
-            # 6. Per-Layer Standalone Maps & Top-K Channel Sheets
+            # 6. Per-Layer Standalone Maps & Top-K Channel Sheets (Backbone + Neck Head Inputs)
             layers_root = img_out_dir / "layers"
             for key, rec in records_a.items():
                 _, h_f, w_f = proj_a[key]["shape"]
@@ -2933,10 +3661,35 @@ def main() -> None:
                     layers_root / f"{key}_{h_f}x{w_f}", ref_panel, rec, proj_a[key],
                     args.imgsz, crop_box, colormap_id, args.alpha, args.clip_percentile, args.channels,
                 )
+            for n_key, n_rec in neck_rec_a.items():
+                _, h_f, w_f = neck_proj_a[n_key]["shape"]
+                save_per_layer_assets(
+                    layers_root / f"{n_key}_{h_f}x{w_f}", ref_panel, n_rec, neck_proj_a[n_key],
+                    args.imgsz, crop_box, colormap_id, args.alpha, args.clip_percentile, args.channels,
+                )
 
-            # 7. Optional Side-by-Side Semantic Comparison
+            # 7. IG-PAN Neck Routing & Glare Diagnostics + Neck Head-Input Pyramid
+            igpan_dir = img_out_dir / "igpan"
+            if igpan_a is not None:
+                fig7 = build_igpan_routing_and_glare_figure(
+                    ref_panel, igpan_a, neck_rec_a, neck_proj_a,
+                    args.imgsz, crop_box, colormap_id, attn_colormap_id,
+                    args.alpha, args.clip_percentile, model_title, igpan_dir,
+                )
+                if fig7 is not None:
+                    cv2.imwrite(str(img_out_dir / "07_igpan_neck_routing_and_glare_gates.png"), fig7)
+
+            fig8 = build_neck_pyramid_and_stats_figure(
+                raw_panel, det_panel, ref_panel, neck_rec_a, neck_proj_a, recorder_a.neck_slots,
+                igpan_a, args.imgsz, crop_box, colormap_id, args.alpha, args.clip_percentile,
+                model_title, Path(img_path).name,
+            )
+            if fig8 is not None:
+                cv2.imwrite(str(img_out_dir / "08_igpan_neck_pyramid_and_quant_stats.png"), fig8)
+
+            # 8. Optional Side-by-Side Semantic Comparison (Backbone 160->20 AND Neck Head Inputs 80->20)
             if model_b is not None and recorder_b is not None:
-                records_b, proj_b, _, _ = run_inference_and_record(
+                records_b, proj_b, neck_rec_b, neck_proj_b, _, _, _ = run_inference_and_record(
                     model_b, recorder_b, inp_tensor, orig_hw, ratio_pad, crop_box,
                     args.imgsz, args.conf_thres, args.iou_thres, fallback_illum_ext,
                 )
@@ -2948,6 +3701,15 @@ def main() -> None:
                 )
                 cv2.imwrite(str(img_out_dir / "06_backbone_comparison_160_to_20.png"), fig6)
 
+                fig9 = build_neck_comparison_figure(
+                    ref_panel,
+                    neck_rec_a, neck_proj_a, recorder_a.neck_slots, meta_a["weights_label"],
+                    neck_rec_b, neck_proj_b, recorder_b.neck_slots, meta_b["weights_label"],
+                    args.imgsz, crop_box, colormap_id, args.alpha, args.clip_percentile,
+                )
+                if fig9 is not None:
+                    cv2.imwrite(str(img_out_dir / "09_neck_head_comparison_80_to_20.png"), fig9)
+
             scales_str = " -> ".join(
                 f"L{records_a[recorder_a.stage_slots[s]]['layer_idx']:02d}"
                 f"({proj_a[recorder_a.stage_slots[s]]['shape'][1]}x{proj_a[recorder_a.stage_slots[s]]['shape'][2]})"
@@ -2957,6 +3719,8 @@ def main() -> None:
             print(f"  [{img_idx}/{len(image_paths)}] Saved {stem}: {scales_str} -> {img_out_dir}")
             if info_a is not None:
                 _print_regime_summary(stem, info_a)
+            if igpan_a is not None:
+                _print_igpan_summary(stem, igpan_a)
     finally:
         recorder_a.close()
         if recorder_b is not None:
